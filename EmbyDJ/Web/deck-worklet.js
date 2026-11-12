@@ -8,7 +8,7 @@
  *   - click-free start / stop via a short gain ramp
  * Interpolation: 4-point cubic Hermite.
  *
- * Messages in (port):  load {L, R}, unload, play {pos?, rate}, stop, seek {pos}, rate {rate},
+ * Messages in (port):  load {L, R}, unload, play {pos?, rate, when?}, stop, seek {pos}, rate {rate},
  *                      loop {active, start, end}, scratchBegin {pos}, scratchMove {pos},
  *                      scratchEnd {resume, pos?, rate},
  *                      spin {vel, dur, resume, resumePos?, rate}  (backspin: vel < 0, brake: vel > 0),
@@ -36,6 +36,7 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
         this.fade = 0;         // remaining crossfade samples
         this.fadePos = 0;      // read head of the outgoing signal during a crossfade
         this.fadeStep = 0;
+        this.pendingPlay = null; // play scheduled for a later AudioContext time (Auto-Mix)
         this.spin = false;     // backspin / brake: speed runs linearly from vel to 0
         this.spinDecel = 0;
         this.spinResume = false;
@@ -56,15 +57,19 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
                 break;
             case 'play':
                 this.spin = false;
+                if (m.when && m.when > currentTime + 0.003) { this.pendingPlay = m; break; }
+                this.pendingPlay = null;
                 if (m.pos != null) this.jump(m.pos * sr);
                 this.rate = m.rate;
                 this.playing = true;
                 break;
             case 'stop':
+                this.pendingPlay = null;
                 this.spin = false;
                 this.playing = false;
                 break;
             case 'seek':
+                this.pendingPlay = null;
                 this.spin = false;
                 this.jump(m.pos * sr);
                 break;
@@ -149,6 +154,13 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
         if (!this.L) return true;
 
         const sr = sampleRate;
+        if (this.pendingPlay && currentTime >= this.pendingPlay.when) {
+            const m = this.pendingPlay;
+            this.pendingPlay = null;
+            if (m.pos != null) this.jump(m.pos * sr);
+            this.rate = m.rate;
+            this.playing = true;
+        }
         const follow = 1 / (sr * 0.025);   // scratch: close the gap to the target within ~25 ms
         const smoothing = 0.0025;          // scratch: speed smoothing per sample (~8 ms)
         const ampStep = 0.004;             // start/stop ramp (~5 ms)

@@ -11,7 +11,7 @@
     var LANG = 'en'; // UI is English only
     var TEXT = {
         en: {
-            noTrack: 'No track loaded', search: 'Search title, artist, album…', sortTitle: 'Title', sortArtist: 'Artist',
+            noTrack: 'No track loaded', search: 'Search title, artist, album, genre…', sortTitle: 'Title', sortArtist: 'Artist',
             sortAlbum: 'Album', sortAdded: 'Recently added', sortRandom: 'Random', colTitle: 'Title',
             colArtist: 'Artist', colAlbum: 'Album', colTime: 'Time', shortcuts: 'Keyboard shortcuts',
             hotcueHelp: 'Hot cue: click = set / jump, right-click = delete.',
@@ -25,7 +25,9 @@
             smpFolderChoose: 'Choose a folder with your samples.', smpFolderReconnect: 'Allow access to the sample folder again.',
             smpFolderEmpty: 'No audio files or folders here.',
             noBackspin: 'Backspin needs the Worklet engine (https or localhost).',
-            loadingMore: 'Loading…', noMusic: 'No music found.', noMatch: 'No title, artist or album matches.', downloading: 'Loading track… {p}',
+            amNext: 'Next: {n}', amLoading: 'Loading next track…', amNoTrack: 'Auto-Mix: no track to play in the current list.',
+            amStopped: 'Auto-Mix stopped (manual control).', trackSortHint: 'Sorting by track number works when the list contains a single album (e.g. search for the album).',
+            loadingMore: 'Loading…', noMusic: 'No music found.', noMatch: 'No title, artist, album or genre matches.', downloading: 'Loading track… {p}',
             decoding: 'Decoding…', analyzing: 'Analyzing…', deckPlaying: 'Deck {d} is playing – pause it first.',
             bothPlaying: 'Both decks are playing.', loadFailed: 'Could not load track: {e}',
             noAuth: 'Not signed in', noAuthHint: 'Open EmbyDJ from the Emby web app (left menu → EmbyDJ) while signed in.',
@@ -248,15 +250,44 @@
                 peak[b] = pk;
             }
             if (b < bins) return sleep0().then(chunk);
+            var loudness = measureLoudness(low, mid, high, WAVE_FPS);
             [low, mid, high, peak].forEach(function (arr) {
                 var mx = 1e-9;
                 for (var k = 0; k < arr.length; k++) if (arr[k] > mx) mx = arr[k];
                 for (k = 0; k < arr.length; k++) arr[k] /= mx;
             });
-            return { fps: WAVE_FPS, bins: bins, low: low, mid: mid, high: high, peak: peak };
+            return { fps: WAVE_FPS, bins: bins, low: low, mid: mid, high: high, peak: peak, loudness: loudness };
         }
         return chunk();
     }
+
+    // ---- loudness ----
+    // Integrated loudness in LUFS, an approximation of ITU-R BS.1770 / EBU R128 from the band levels:
+    // weighted like the K-filter (less low end, +4 dB highs), 400 ms blocks every 100 ms, absolute gate
+    // -70 LUFS, relative gate -10 LU. The +3 dB stands for the two stereo channels (the analysis uses
+    // the mono sum). Accurate enough to bring tracks to a similar level, which is all Auto-Gain needs.
+    function measureLoudness(low, mid, high, fps) {
+        var n = low.length, block = Math.round(fps * 0.4), step = Math.round(fps * 0.1);
+        var pw = new Float64Array(n + 1);   // prefix sums of the weighted power
+        for (var i = 0; i < n; i++) pw[i + 1] = pw[i] + 0.5 * low[i] * low[i] + mid[i] * mid[i] + 2.5 * high[i] * high[i];
+        var blocks = [];
+        for (var s = 0; s + block <= n; s += step) blocks.push((pw[s + block] - pw[s]) / block);
+        if (!blocks.length) return null;
+        var lufs = function (p) { return -0.691 + 3.01 + 10 * Math.log10(p); };
+        var avg = function (arr) { var t = 0; arr.forEach(function (p) { t += p; }); return t / arr.length; };
+        var aboveAbs = blocks.filter(function (p) { return p > 0 && lufs(p) > -70; });
+        if (!aboveAbs.length) return null;
+        var relGate = lufs(avg(aboveAbs)) - 10;
+        var gated = aboveAbs.filter(function (p) { return lufs(p) > relGate; });
+        return Math.round(lufs(avg(gated)) * 10) / 10;
+    }
+
+    // ---- Auto-Gain: brings every track to about the same loudness via the channel GAIN ----
+    var AUTO_GAIN_TARGET = -14;   // LUFS
+    var AUTO_GAIN_MAX = 9;        // dB, max. boost (the limiter catches the rest)
+    var autoGain = (function () { try { return localStorage.getItem('embydj-autogain') !== 'off'; } catch (e) { return true; } })();
+
+    function autoGainDb(loudness) { return clamp(AUTO_GAIN_TARGET - loudness, -12, AUTO_GAIN_MAX); }
 
     // ---- BPM + first-beat detection (onset envelope, autocorrelation, comb refinement) ----
     function detectBpm(w) {
@@ -579,7 +610,7 @@
         var R = audio.numberOfChannels > 1 ? new Float32Array(audio.getChannelData(1)) : null;
         this.post({ type: 'load', L: L, R: R }, R ? [L.buffer, R.buffer] : [L.buffer]);
     };
-    WorkletEngine.prototype.start = function (pos, rate) { this.post({ type: 'play', pos: pos, rate: rate }); };
+    WorkletEngine.prototype.start = function (pos, rate, when) { this.post({ type: 'play', pos: pos, rate: rate, when: when || 0 }); };
     WorkletEngine.prototype.stop = function () { this.post({ type: 'stop' }); };
     WorkletEngine.prototype.setRate = function (rate) { this.post({ type: 'rate', rate: rate }); };
     WorkletEngine.prototype.setLoop = function (loop) { this.post({ type: 'loop', active: loop.active, start: loop.start, end: loop.end }); };
@@ -607,7 +638,7 @@
         return Promise.resolve({ L: L, R: R });
     };
     BufferEngine.prototype.load = function (audio) { this.stop(); this.audio = audio; this.loop = { active: false, start: 0, end: 0 }; };
-    BufferEngine.prototype.start = function (pos, rate) {
+    BufferEngine.prototype.start = function (pos, rate, when) {
         this.stop();
         if (!this.audio) return;
         var self = this, token = ++this.token;
@@ -617,7 +648,7 @@
         if (this.loop.active) { src.loop = true; src.loopStart = this.loop.start; src.loopEnd = this.loop.end; }
         src.connect(this.deck.trim);
         src.onended = function () { if (token === self.token) { self.src = null; self.deck.onEngineMessage({ type: 'ended' }); } };
-        src.start(0, clamp(pos, 0, Math.max(0, this.audio.duration - 0.001)));
+        src.start(when || 0, clamp(pos, 0, Math.max(0, this.audio.duration - 0.001)));
         this.src = src;
     };
     BufferEngine.prototype.stop = function () {
@@ -802,7 +833,7 @@
         if (this.spinState) return this.spinPos();
         if (this.scratching) return this.scratchPos;
         if (!this.playing) return this.pos;
-        var p = this.pos + (ctx.currentTime - this.startCtx) * this.rate;
+        var p = this.pos + Math.max(0, ctx.currentTime - this.startCtx) * this.rate;
         if (this.loop.active && p >= this.loop.end) {
             var L = this.loop.end - this.loop.start;
             p = this.loop.start + ((p - this.loop.start) % L);
@@ -922,6 +953,22 @@
         this.playing = false;
         this.pos = p;
         this.engine.stop();
+    };
+
+    // start playback at track position `pos` at AudioContext time `when` (Auto-Mix)
+    Deck.prototype.playAt = function (pos, when) {
+        this.cancelSpin();
+        if (!this.buffer) return;
+        resumeAudio();
+        this.playing = true;
+        this.pos = clamp(pos, 0, Math.max(0, this.duration - 0.001));
+        this.startCtx = when;
+        this.engine.start(this.pos, this.rate, when);
+    };
+
+    Deck.prototype.forwardspin = function () {
+        var bl = this.beatLen() || 0.5;
+        this.spin(3 * Math.max(this.rate, 0.5), Math.min(2.5, 2 * bl / Math.max(this.rate, 0.5)), 'button');
     };
 
     Deck.prototype.backspin = function () {
@@ -1142,8 +1189,8 @@
     // ---- loading ----
     Deck.prototype.load = function (item) {
         var self = this;
-        if (this.playing) { toast(t('deckPlaying', { d: this.id })); return; }
-        var token = ++this.loadToken;
+        if (this.playing) { toast(t('deckPlaying', { d: this.id })); return Promise.resolve(false); }
+        var token = ++this.loadToken, loaded = false;
         var ui = this.ui;
         if (ticksToSec(item.RunTimeTicks) > 30 * 60) toast(t('longTrack'));
 
@@ -1162,7 +1209,7 @@
         }
         function decode(buf) { return ctx.decodeAudioData(buf); }
 
-        Promise.all([fetchAudio(item, false, progress), fetchMeta([item.Id])])
+        return Promise.all([fetchAudio(item, false, progress), fetchMeta([item.Id])])
             .then(function (r) {
                 if (token !== self.loadToken) return null;
                 ui.loadingText.textContent = t('decoding');
@@ -1202,6 +1249,13 @@
                 self.meta = meta;
                 self.pos = meta.cue || 0;
                 self.overview = null;
+                self.loudness = res.wave.loudness;
+                if (self.loudness != null && meta.loudness !== self.loudness) { meta.loudness = self.loudness; detected = true; }
+                self.applyAutoGain();
+                // a new track starts at its original tempo
+                self.nudge = 1;
+                self.setTempo(0);
+                loaded = true;
                 markLoadedRows();
                 if (detected) saveMeta(item.Id, meta);
             })
@@ -1211,6 +1265,7 @@
             })
             .then(function () {
                 if (token === self.loadToken) ui.loading.classList.remove('show');
+                return loaded;
             });
     };
 
@@ -1236,7 +1291,8 @@
             tempo: q('.tempo-fader'), range: q('.tempo-range'),
             fxType: q('.fx-type'), fxOn: q('.fx-on'), fxValue: q('.fx-value'),
             fxP1Label: q('[data-fx="p1"] span'), fxP2Label: q('[data-fx="p2"] span'),
-            vinyl: q('.vinyl-btn'), slip: q('.slip-btn'), backspin: q('.backspin-btn'), brake: q('.brake-btn')
+            vinyl: q('.vinyl-btn'), slip: q('.slip-btn'), backspin: q('.backspin-btn'), brake: q('.brake-btn'),
+            forwardspin: q('.fwdspin-btn')
         };
         var ui = this.ui;
         ui.hotcues.forEach(function (b, i) { b.style.setProperty('--hc', HOTCUE_COLORS[i]); });
@@ -1245,10 +1301,12 @@
         ui.slip.addEventListener('click', function () { self.slip = !self.slip; self.savePrefs(); });
         ui.backspin.addEventListener('click', function () { self.backspin(); });
         ui.brake.addEventListener('click', function () { self.brake(); });
+        ui.forwardspin.addEventListener('click', function () { self.forwardspin(); });
+        q('.pitch-zero').addEventListener('click', function () { self.setTempo(0); });
 
         // transport
-        ui.play.addEventListener('click', function () { self.togglePlay(); });
-        ui.cue.addEventListener('pointerdown', function (e) { e.preventDefault(); self.cueDown(); });
+        ui.play.addEventListener('click', function () { manual(); self.togglePlay(); });
+        ui.cue.addEventListener('pointerdown', function (e) { e.preventDefault(); manual(); self.cueDown(); });
         ui.cue.addEventListener('pointerup', function () { self.cueUp(); });
         ui.cue.addEventListener('pointerleave', function () { self.cueUp(); });
         ui.sync.addEventListener('click', function () { self.syncTo(self.other); });
@@ -1328,6 +1386,7 @@
                 var span = Math.max(0.03, (now - first) / 1000);
                 var v = sum / span;
                 if (v <= -2) self.spin(Math.max(v, -8), clamp(-v / 3, 0.4, 2.5), 'flick');
+                else if (v >= 3) self.spin(Math.min(v, 8), clamp(v / 3, 0.4, 2.5), 'flick');
                 else self.scratchEnd();
             }
             self.jog = null;
@@ -1369,8 +1428,15 @@
             e.preventDefault();
             root.classList.remove('drop-target');
             var item = libItemsById[e.dataTransfer.getData('text/x-embydj-id')];
-            if (item) self.load(item);
+            if (item) { manual(); self.load(item); }
         });
+    };
+
+    // Auto-Gain on: GAIN from the measured loudness; off: GAIN back to 0 dB
+    Deck.prototype.applyAutoGain = function () {
+        if (!this.trimKnob || this.loudness == null) return;
+        var db = autoGain ? autoGainDb(this.loudness) : 0;
+        this.trimKnob.set(0.5 + db / 24);
     };
 
     Deck.prototype.buildChannel = function (host) {
@@ -1383,7 +1449,12 @@
 
         root.querySelectorAll('.knob').forEach(function (el) {
             var p = el.dataset.param;
-            if (p === 'trim') initKnob(el, 0.5, function (v) { smooth(self.trim.gain, dbToGain((v - 0.5) * 24)); });
+            if (p === 'trim') self.trimKnob = initKnob(el, 0.5, function (v) {
+                var db = (v - 0.5) * 24;
+                smooth(self.trim.gain, dbToGain(db));
+                el.title = 'Gain ' + (db >= 0 ? '+' : '') + db.toFixed(1) + ' dB' +
+                    (self.loudness != null ? ' (track: ' + self.loudness.toFixed(1) + ' LUFS)' : '') + ' - double-click resets';
+            });
             else if (p === 'filter') initKnob(el, 0.5, function (v) { self.setFilter((v - 0.5) * 2); });
             else initKnob(el, 0.5, function (v) {
                 self.eqDb[p] = v < 0.5 ? (v - 0.5) * 2 * 26 : (v - 0.5) * 2 * 6;
@@ -1421,6 +1492,7 @@
         toggle(ui.vinyl, 'on', this.vinyl);
         toggle(ui.slip, 'on', this.slip);
         toggle(ui.backspin, 'on', !!this.spinState && this.spinState.v0 < 0);
+        toggle(ui.forwardspin, 'on', !!this.spinState && this.spinState.v0 > this.rate * 1.5);
         toggle(ui.brake, 'on', !!this.spinState && this.spinState.v0 > 0);
         toggle(ui.jog, 'scratching', this.scratching);
         toggle(ui.cue, 'on', !!this.buffer && !this.playing && Math.abs(this.pos - (this.meta.cue || 0)) < 0.02);
@@ -1700,7 +1772,7 @@
     // Library
     // =====================================================================================
     var lib = { parentId: '', search: '', sort: 'SortName', desc: false, start: 0, total: 0, loading: false, gen: 0,
-        bpmPhase: false, shown: {} };
+        bpmPhase: false, genrePhase: false, genre: null, shown: {} };
     var libItemsById = {};
     var libRowsById = {};
     var PAGE = 100;
@@ -1742,6 +1814,8 @@
         lib.total = 0;
         lib.loading = false;
         lib.bpmPhase = lib.sort === 'Bpm' && !lib.search;
+        lib.genrePhase = lib.sort === 'Genre' && !lib.search;
+        lib.genre = { list: null, i: 0, start: 0 };
         lib.shown = {};
         renderSortHeaders();
         $('#libBody').innerHTML = '';
@@ -1762,13 +1836,29 @@
         var name = (item.SortName || item.Name || '').toLowerCase();
         var num = function (n) { return ('0000' + (n || 0)).slice(-4); };
         if (lib.sort.indexOf('AlbumArtist') === 0) return artist + '\u0000' + album + '\u0000' + num(item.ParentIndexNumber) + num(item.IndexNumber) + name;
+        if (lib.sort === 'ParentIndexNumber,IndexNumber,SortName') return num(item.ParentIndexNumber) + num(item.IndexNumber) + name;
         if (lib.sort.indexOf('Album') === 0) return album + '\u0000' + num(item.ParentIndexNumber) + num(item.IndexNumber) + name;
         return name;
     }
 
     function bpmOf(id) { var m = metaCache[id]; return m && m.bpm ? +m.bpm : 0; }
 
+    function firstGenre(item) {
+        var g = (item.Genres || []).slice().sort(function (a, b) { return a.localeCompare(b); })[0];
+        return g ? g.toLowerCase() : '';
+    }
+
     function sortResults(items) {
+        if (lib.sort === 'Genre') {
+            var withGenre = items.filter(function (it) { return firstGenre(it); });
+            var without = items.filter(function (it) { return !firstGenre(it); });
+            var keyed = withGenre.map(function (it) {
+                return { k: firstGenre(it) + '\u0000' + (it.AlbumArtist || artistOf(it) || '').toLowerCase() + '\u0000' + (it.SortName || it.Name || '').toLowerCase(), it: it };
+            });
+            keyed.sort(function (a, b) { return a.k < b.k ? -1 : a.k > b.k ? 1 : 0; });
+            if (lib.desc) keyed.reverse();
+            return keyed.map(function (x) { return x.it; }).concat(without);
+        }
         if (lib.sort === 'Bpm') {
             // tracks without a BPM always go last
             var dir = lib.desc ? -1 : 1;
@@ -1798,7 +1888,7 @@
     function searchTracks(term) {
         var base = {
             IncludeItemTypes: 'Audio', Recursive: true, ParentId: lib.parentId, Limit: SEARCH_LIMIT,
-            EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1, Fields: 'DateCreated,SortName'
+            EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1, Fields: 'DateCreated,SortName,Genres'
         };
         var itemsUrl = '/Users/' + auth.userId + '/Items';
         var none = { Items: [] };
@@ -1814,7 +1904,9 @@
             apiJson('/Artists', { SearchTerm: term, UserId: auth.userId, ParentId: lib.parentId, Limit: 25 })
                 .then(function (r) { return tracksFor('ArtistIds', r); }).catch(function () { return none; }),
             apiJson(itemsUrl, { IncludeItemTypes: 'MusicAlbum', Recursive: true, SearchTerm: term, ParentId: lib.parentId, Limit: 25 })
-                .then(function (r) { return tracksFor('AlbumIds', r); }).catch(function () { return none; })
+                .then(function (r) { return tracksFor('AlbumIds', r); }).catch(function () { return none; }),
+            apiJson('/MusicGenres', { SearchTerm: term, UserId: auth.userId, ParentId: lib.parentId, IncludeItemTypes: 'Audio', Recursive: true, Limit: 10 })
+                .then(function (r) { return tracksFor('GenreIds', r); }).catch(function () { return none; })
         ]).then(function (results) {
             var seen = {}, merged = [];
             results.forEach(function (r) {
@@ -1853,6 +1945,16 @@
                 return libMore();   // continue with the tracks without BPM
             });
         }
+        if (lib.genrePhase) {
+            return libGenrePage(gen).catch(function (e) {
+                if (gen === lib.gen) { $('#libMore').textContent = String(e.message || e); lib.genrePhase = false; }
+            }).then(function () {
+                if (gen !== lib.gen) return;
+                lib.loading = false;
+                $('#libMore').textContent = '';
+                if (!lib.genrePhase) return libMore();   // all genres listed: continue with the tracks without genre
+            });
+        }
         if (lib.search) {
             return libSearch(gen).catch(function (e) {
                 if (gen === lib.gen) $('#libMore').textContent = String(e.message || e);
@@ -1863,10 +1965,10 @@
         var params = {
             IncludeItemTypes: 'Audio', Recursive: true, StartIndex: lib.start, Limit: PAGE,
             ParentId: lib.parentId, SearchTerm: lib.search, EnableUserData: false,
-            EnableImageTypes: 'Primary', ImageTypeLimit: 1, Fields: 'PrimaryImageAspectRatio'
+            EnableImageTypes: 'Primary', ImageTypeLimit: 1, Fields: 'Genres'
         };
         if (lib.sort === 'Random') params.SortBy = 'Random';
-        else if (lib.sort === 'Bpm') { params.SortBy = 'SortName'; params.SortOrder = 'Ascending'; } // tracks without BPM, after the BPM phase
+        else if (lib.sort === 'Bpm' || lib.sort === 'Genre') { params.SortBy = 'SortName'; params.SortOrder = 'Ascending'; } // the rest, after the BPM / genre phase
         else { params.SortBy = lib.sort; params.SortOrder = lib.desc ? 'Descending' : 'Ascending'; }
 
         return apiJson('/Users/' + auth.userId + '/Items', params).then(function (res) {
@@ -1875,7 +1977,7 @@
             lib.total = res.TotalRecordCount || 0;
             lib.start += items.length;
             if (!items.length) lib.total = lib.start;
-            // in BPM mode the tracks with a BPM are already listed at the top
+            // in BPM / genre mode the tracks with a BPM / genre are already listed at the top
             items = items.filter(function (i) { return !lib.shown[i.Id]; });
             appendRows(items);
             $('#libCount').textContent = t('tracks', { n: lib.total.toLocaleString('en-US') });
@@ -1903,7 +2005,7 @@
             return Promise.all(chunks.map(function (chunk) {
                 return apiJson('/Users/' + auth.userId + '/Items', {
                     Ids: chunk.join(','), ParentId: lib.parentId, IncludeItemTypes: 'Audio', Recursive: true,
-                    EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1
+                    EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1, Fields: 'Genres'
                 }).then(function (r) { return r.Items || []; });
             })).then(function (parts) {
                 if (gen !== lib.gen) return;
@@ -1914,6 +2016,49 @@
                 items.forEach(function (it) { lib.shown[it.Id] = true; updateLibraryBpm(it.Id); });
             });
         });
+    }
+
+    // Sorting by genre: Emby cannot sort by genre, so the genres are listed alphabetically and the
+    // tracks are loaded genre by genre (a track with several genres appears under the first one).
+    // Tracks without a genre follow at the end through the normal paging.
+    function libGenrePage(gen) {
+        var g = lib.genre, appended = 0;
+        var ready = g.list ? Promise.resolve() : Promise.all([
+            apiJson('/MusicGenres', {
+                UserId: auth.userId, ParentId: lib.parentId, IncludeItemTypes: 'Audio', Recursive: true,
+                SortBy: 'SortName'
+            }),
+            apiJson('/Users/' + auth.userId + '/Items', { IncludeItemTypes: 'Audio', Recursive: true, ParentId: lib.parentId, Limit: 0 })
+        ]).then(function (r) {
+            // Emby ignores SortOrder for genres: sort here (case-insensitive), reverse for descending
+            g.list = (r[0].Items || []).slice().sort(function (a, b) { return a.Name.localeCompare(b.Name, undefined, { sensitivity: 'base' }); });
+            if (lib.desc) g.list.reverse();
+            $('#libCount').textContent = t('tracks', { n: (r[1].TotalRecordCount || 0).toLocaleString('en-US') });
+        });
+        function step() {
+            if (gen !== lib.gen) return;
+            if (g.i >= g.list.length) { lib.genrePhase = false; return; }
+            if (appended >= PAGE) return;            // enough for this scroll step
+            var genre = g.list[g.i];
+            return apiJson('/Users/' + auth.userId + '/Items', {
+                IncludeItemTypes: 'Audio', Recursive: true, ParentId: lib.parentId, GenreIds: genre.Id,
+                SortBy: 'AlbumArtist,Album,SortName', SortOrder: 'Ascending', StartIndex: g.start, Limit: PAGE,
+                EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1, Fields: 'Genres'
+            }).then(function (r) {
+                if (gen !== lib.gen) return;
+                var all = r.Items || [];
+                g.start += all.length;
+                if (!all.length || g.start >= (r.TotalRecordCount || 0)) { g.i++; g.start = 0; }
+                var items = all.filter(function (it) { return !lib.shown[it.Id]; });
+                items.forEach(function (it) { lib.shown[it.Id] = true; });
+                appendRows(items);
+                appended += items.length;
+                return fetchMeta(items.map(function (i) { return i.Id; })).then(function () {
+                    items.forEach(function (i) { updateLibraryBpm(i.Id); });
+                }).then(step);
+            });
+        }
+        return ready.then(step);
     }
 
     function setSort(sort, desc) {
@@ -1942,22 +2087,86 @@
             var img = imageUrl(item, 52);
             tr.innerHTML =
                 '<td class="c-load"><button class="btn la">A</button> <button class="btn lb">B</button></td>' +
-                '<td class="c-cover">' + (img ? '<img loading="lazy" alt="">' : '') + '</td>' +
-                '<td></td><td></td><td></td><td class="c-num c-bpm"></td><td class="c-num"></td>';
-            var tds = tr.children;
-            if (img) tds[1].firstChild.src = img;
-            tds[2].textContent = item.Name || '';
-            tds[3].textContent = artistOf(item);
-            tds[4].textContent = item.Album || '';
-            tds[6].textContent = fmtTime(ticksToSec(item.RunTimeTicks));
-            tds[2].title = item.Name || '';
-            tds[3].title = tds[3].textContent;
-            tds[4].title = tds[4].textContent;
+                '<td class="c-cover col-cover">' + (img ? '<img loading="lazy" alt="">' : '') + '</td>' +
+                '<td class="c-num c-track col-track"></td><td class="col-title"></td><td class="col-artist"></td>' +
+                '<td class="col-album"></td><td class="col-genre"></td><td class="c-num c-bpm col-bpm"></td><td class="c-num col-time"></td>';
+            var cell = function (c) { return tr.querySelector('.col-' + c); };
+            if (img) cell('cover').firstChild.src = img;
+            var disc = item.ParentIndexNumber > 1 ? item.ParentIndexNumber + '-' : '';
+            cell('track').textContent = item.IndexNumber ? disc + item.IndexNumber : '';
+            cell('title').textContent = cell('title').title = item.Name || '';
+            cell('artist').textContent = cell('artist').title = artistOf(item);
+            cell('album').textContent = cell('album').title = item.Album || '';
+            cell('genre').textContent = cell('genre').title = (item.Genres || []).join(', ');
+            cell('time').textContent = fmtTime(ticksToSec(item.RunTimeTicks));
             libRowsById[item.Id] = tr;
             frag.appendChild(tr);
         });
         body.appendChild(frag);
         markLoadedRows();
+        updateTrackSort();
+    }
+
+    // sorting by track number only makes sense for a list that contains a single album
+    function singleAlbumList() {
+        if (lib.start < lib.total) return false;
+        var album = null, ok = true;
+        document.querySelectorAll('#libBody tr').forEach(function (tr) {
+            var it = libItemsById[tr.dataset.id];
+            var a = it && it.AlbumId;
+            if (!a) { ok = false; return; }
+            if (album === null) album = a; else if (album !== a) ok = false;
+        });
+        return ok && album !== null;
+    }
+
+    function updateTrackSort() {
+        var th = document.querySelector('.lib-table th.c-track');
+        if (!th) return;
+        var on = singleAlbumList();
+        toggle(th, 'disabled', !on);
+        if (!on && lib.sort !== 'ParentIndexNumber,IndexNumber,SortName') th.title = t('trackSortHint');
+    }
+
+    // ---- column chooser (button or right-click on the table header) ----
+    var LIB_COLUMNS = ['cover', 'track', 'artist', 'album', 'genre', 'bpm', 'time'];
+
+    function applyColumns(hidden) {
+        var table = document.querySelector('.lib-table');
+        LIB_COLUMNS.forEach(function (c) { toggle(table, 'hide-' + c, hidden.indexOf(c) >= 0); });
+        document.querySelectorAll('#colMenu input').forEach(function (cb) { cb.checked = hidden.indexOf(cb.value) < 0; });
+    }
+
+    function hiddenColumns() {
+        try { return JSON.parse(localStorage.getItem('embydj-hidden-columns') || '[]') || []; } catch (e) { return []; }
+    }
+
+    function bindColumns() {
+        var menu = $('#colMenu');
+        function open(x, y) {
+            menu.classList.remove('hidden');
+            var r = menu.getBoundingClientRect();
+            menu.style.left = Math.min(x, window.innerWidth - r.width - 8) + 'px';
+            menu.style.top = Math.min(y, window.innerHeight - r.height - 8) + 'px';
+        }
+        $('#colBtn').addEventListener('click', function (e) {
+            var r = e.currentTarget.getBoundingClientRect();
+            open(r.left, r.bottom + 4);
+        });
+        document.querySelector('.lib-table thead').addEventListener('contextmenu', function (e) {
+            e.preventDefault();
+            open(e.clientX, e.clientY);
+        });
+        menu.addEventListener('change', function () {
+            var hidden = [];
+            menu.querySelectorAll('input').forEach(function (cb) { if (!cb.checked) hidden.push(cb.value); });
+            try { localStorage.setItem('embydj-hidden-columns', JSON.stringify(hidden)); } catch (e) { /* ignore */ }
+            applyColumns(hidden);
+        });
+        document.addEventListener('pointerdown', function (e) {
+            if (!menu.classList.contains('hidden') && !menu.contains(e.target) && e.target.id !== 'colBtn') menu.classList.add('hidden');
+        }, true);
+        applyColumns(hiddenColumns());
     }
 
     function updateLibraryBpm(id) {
@@ -1988,13 +2197,13 @@
             var btn = e.target.closest('button');
             if (!btn) return;
             var item = libItemsById[btn.closest('tr').dataset.id];
-            if (btn.classList.contains('la')) decks[0].load(item);
-            else if (btn.classList.contains('lb')) decks[1].load(item);
+            if (btn.classList.contains('la')) { manual(); decks[0].load(item); }
+            else if (btn.classList.contains('lb')) { manual(); decks[1].load(item); }
         });
         body.addEventListener('dblclick', function (e) {
             if (e.target.closest('button')) return;
             var tr = e.target.closest('tr');
-            if (tr) loadToFreeDeck(libItemsById[tr.dataset.id]);
+            if (tr) { manual(); loadToFreeDeck(libItemsById[tr.dataset.id]); }
         });
         body.addEventListener('dragstart', function (e) {
             var tr = e.target.closest('tr');
@@ -2012,6 +2221,7 @@
         document.querySelectorAll('.lib-table th.sortable').forEach(function (th) {
             th.addEventListener('click', function () {
                 var s = th.dataset.sort;
+                if (th.classList.contains('disabled') && s !== lib.sort) { toast(t('trackSortHint')); return; }
                 setSort(s, s === lib.sort ? !lib.desc : false);
             });
         });
@@ -2594,12 +2804,335 @@
     }
 
     // =====================================================================================
+    // Auto-Mix: plays one track after another with beat-matched transitions.
+    //   - the next track is preloaded on the idle deck while the current one plays
+    //   - tracks with a similar tempo (max. 8 % apart) are synced (tempo + beat phase),
+    //     otherwise the transition is a plain crossfade
+    //   - silence at the start / end of a track is skipped
+    //   - start and crossfade are scheduled on the audio clock, so they stay exact even when
+    //     the browser throttles timers in a background tab
+    //   - any manual control of transport, crossfader or loading stops the Auto-Mix
+    // =====================================================================================
+    var AM_SYNC_LIMIT = 0.08;      // max. tempo difference for a beat-synced transition
+    var AM_PLAIN_FADE = 8;         // seconds, transition without sync
+    var AM_LEAD = 3;               // schedule the transition this many seconds ahead
+    var AM_MIN_TRACK = 20;         // seconds, shorter tracks are skipped
+
+    var am = {
+        on: false, cur: -1, next: null, nextLoading: false, fade: null,
+        played: {}, listIndex: -1, timer: null, finishTimer: null, glideTimer: null
+    };
+
+    function amDeck(i) { return decks[i]; }
+    function amOther(i) { return i === 0 ? 1 : 0; }
+
+    // audible range of a track (silence at the start / end skipped), in track seconds
+    function audibleBounds(deck) {
+        var w = deck.wave, dur = deck.duration;
+        if (!w) return { start: 0, end: dur };
+        var thrStart = 0.04, thrEnd = 0.06, s = 0, e = w.bins - 1;
+        while (s < w.bins && w.peak[s] < thrStart) s++;
+        while (e > s && w.peak[e] < thrEnd) e--;
+        return { start: Math.min(s / w.fps, dur), end: Math.min((e + 1) / w.fps, dur) };
+    }
+
+    function amSetStatus() {
+        toggle($('#amBtn'), 'on', am.on);
+        var label = '';
+        if (am.on) {
+            if (am.next && am.next.item) label = t('amNext', { n: artistOf(am.next.item) + ' – ' + (am.next.item.Name || '') });
+            else if (am.nextLoading) label = t('amLoading');
+        }
+        $('#amNext').textContent = label;
+        $('#amNext').title = label;
+    }
+
+    // ---- choosing the next track ----
+    function amListIds() {
+        return Array.prototype.map.call(document.querySelectorAll('#libBody tr'), function (tr) { return tr.dataset.id; });
+    }
+
+    function amPickFromList() {
+        var ids = amListIds();
+        var cur = am.cur >= 0 && amDeck(am.cur).item ? amDeck(am.cur).item.Id : null;
+        var idx = cur ? ids.indexOf(cur) : -1;
+        if (idx < 0) idx = am.listIndex;
+        var nextIdx = idx + 1;
+        if (nextIdx >= ids.length) {
+            if (lib.start < lib.total || lib.genrePhase) return libMore().then(amPickFromList);   // load the next page first
+            nextIdx = 0;                                                       // end of the list: start over
+        }
+        if (!ids.length) return Promise.resolve(null);
+        am.listIndex = nextIdx;
+        var item = libItemsById[ids[nextIdx]];
+        if (item && ticksToSec(item.RunTimeTicks) && ticksToSec(item.RunTimeTicks) < AM_MIN_TRACK && ids.length > 1) {
+            return amPickFromList();
+        }
+        return Promise.resolve(item || null);
+    }
+
+    function amPickRandom() {
+        function usable(it) {
+            var len = ticksToSec(it.RunTimeTicks);
+            return !am.played[it.Id] && (!len || len >= AM_MIN_TRACK) && !decks.some(function (d) { return d.item && d.item.Id === it.Id; });
+        }
+        if (lib.search) {
+            // search results are all loaded: pick among them
+            var pool = amListIds().map(function (id) { return libItemsById[id]; }).filter(function (it) { return it && usable(it); });
+            if (!pool.length) { am.played = {}; pool = amListIds().map(function (id) { return libItemsById[id]; }).filter(Boolean); }
+            return Promise.resolve(pool.length ? pool[Math.floor(Math.random() * pool.length)] : null);
+        }
+        return apiJson('/Users/' + auth.userId + '/Items', {
+            IncludeItemTypes: 'Audio', Recursive: true, ParentId: lib.parentId, SortBy: 'Random', Limit: 10,
+            EnableUserData: false, EnableImageTypes: 'Primary', ImageTypeLimit: 1, Fields: 'Genres'
+        }).then(function (r) {
+            var items = r.Items || [];
+            var pick = items.filter(usable)[0] || items[0] || null;
+            return pick;
+        });
+    }
+
+    function amPickNext() { return $('#amMode').value === 'random' ? amPickRandom() : amPickFromList(); }
+
+    // load the next track onto the idle deck
+    function amPrepareNext() {
+        if (!am.on || am.nextLoading || am.next) return;
+        var target = amOther(am.cur), deck = amDeck(target);
+        if (deck.playing) return;
+        am.nextLoading = true;
+        amSetStatus();
+        amPickNext().then(function (item) {
+            if (!am.on) return false;
+            if (!item) { toast(t('amNoTrack')); amStop(); return false; }
+            return deck.load(item).then(function (ok) { return ok ? item : false; });
+        }).then(function (item) {
+            am.nextLoading = false;
+            if (!am.on || !item) { amSetStatus(); return; }
+            am.played[item.Id] = true;
+            am.next = { deck: target, item: item };
+            amSetStatus();
+        }).catch(function (e) {
+            am.nextLoading = false;
+            console.warn('EmbyDJ: Auto-Mix could not load the next track', e);
+            amSetStatus();
+        });
+    }
+
+    // ---- transition ----
+    function amTransitionPlan(c, n, beats) {
+        var plan = { tempo: 0, sync: false, fade: AM_PLAIN_FADE, startPos: audibleBounds(n).start };
+        var bc = c.meta.bpm ? c.meta.bpm * c.rate : 0, bn = n.meta.bpm || 0;
+        if (bc && bn) {
+            var bnFold = bn;
+            if (bc / bnFold > 1.4) bnFold *= 2; else if (bc / bnFold < 0.7) bnFold /= 2;
+            var needed = bc / bnFold - 1;
+            if (Math.abs(needed) <= AM_SYNC_LIMIT) {
+                plan.sync = true;
+                plan.tempo = needed;
+                plan.bnFold = bnFold;
+                plan.fade = beats * 60 / bc;
+            }
+        }
+        return plan;
+    }
+
+    function amScheduleXfade(from, to, T, dur) {
+        var steps = 64, a = new Float32Array(steps), b = new Float32Array(steps);
+        for (var i = 0; i < steps; i++) {
+            var p = i / (steps - 1);
+            a[i] = Math.cos(p * Math.PI / 2);
+            b[i] = Math.sin(p * Math.PI / 2);
+        }
+        var now = ctx.currentTime;
+        [from.xf.gain, to.xf.gain].forEach(function (g) { g.cancelScheduledValues(now); });
+        from.xf.gain.setValueAtTime(1, now);
+        to.xf.gain.setValueAtTime(0, now);
+        from.xf.gain.setValueCurveAtTime(a, T, dur);
+        to.xf.gain.setValueCurveAtTime(b, T, dur);
+    }
+
+    function amStartTransition(T, beats) {
+        if (!am.next || am.fade) return;
+        var c = amDeck(am.cur), n = amDeck(am.next.deck);
+        var plan = amTransitionPlan(c, n, beats);
+        var now = ctx.currentTime;
+        T = Math.max(T, now + 0.15);
+
+        // keep the transition inside the rest of the current track
+        var remain = c.playing ? (audibleBounds(c).end - c.position()) / c.rate - (T - now) : 0;
+        var fade = Math.max(1, Math.min(plan.fade, remain > 2 ? remain : plan.fade));
+
+        // tempo of the incoming deck
+        if (plan.sync) {
+            var needed = plan.tempo;
+            if (Math.abs(needed) > n.range) n.setRange(Math.abs(needed) <= 0.16 ? 0.16 : 0.5);
+            n.setTempo(needed / n.range);
+        } else {
+            n.setTempo(0);
+        }
+
+        // start position: in phase with the beat of the outgoing deck at time T
+        var startPos = plan.startPos;
+        if (plan.sync && c.meta.bpm) {
+            var beatC = 60 / c.meta.bpm, beatN = 60 / plan.bnFold;
+            var pcT = c.position() + (T - now) * c.rate;
+            var phase = frac((pcT - (c.meta.offset || 0)) / beatC);
+            var offN = n.meta.offset || 0;
+            var k = Math.ceil((plan.startPos - offN) / beatN - phase);
+            startPos = offN + (k + phase) * beatN;
+        }
+
+        n.playAt(startPos, T);
+        amScheduleXfade(c, n, T, fade);
+        am.fade = { T: T, dur: fade, from: am.cur, to: am.next.deck };
+        clearTimeout(am.finishTimer);
+        am.finishTimer = setTimeout(amFinishTransition, (T - now + fade) * 1000 + 150);
+    }
+
+    function amFinishTransition() {
+        var f = am.fade;
+        if (!f) return;
+        am.fade = null;
+        var out = amDeck(f.from), inc = amDeck(f.to);
+        out.pause();
+        out.xf.gain.cancelScheduledValues(ctx.currentTime);
+        inc.xf.gain.cancelScheduledValues(ctx.currentTime);
+        setCrossfader(f.to === 0 ? 0 : 1);
+        am.cur = f.to;
+        am.next = null;
+        amGlideTempo(inc);
+        amSetStatus();
+        amPrepareNext();
+    }
+
+    // after a synced transition, bring the tempo slowly back to 0 % (about 8 s)
+    function amGlideTempo(deck) {
+        clearInterval(am.glideTimer);
+        var start = deck.tempo, steps = 32, i = 0;
+        if (!start) return;
+        am.glideTimer = setInterval(function () {
+            if (!am.on) { clearInterval(am.glideTimer); return; }
+            i++;
+            deck.setTempo(start * (1 - i / steps));
+            if (i >= steps) clearInterval(am.glideTimer);
+        }, 250);
+    }
+
+    function amTick() {
+        if (!am.on || am.fade || am.cur < 0) return;   // cur < 0: the first track is still loading
+        var c = amDeck(am.cur);
+        if (!c.playing) {
+            // the current track ended before a transition was possible: start the next one right away
+            if (am.next) amStartTransition(ctx.currentTime + 0.1, 4);
+            else amPrepareNext();
+            return;
+        }
+        if (!am.next) { amPrepareNext(); return; }
+        var beats = +$('#amLen').value;
+        var plan = amTransitionPlan(c, amDeck(am.next.deck), beats);
+        var remain = (audibleBounds(c).end - c.position()) / c.rate;   // seconds until the audible end
+        var untilStart = remain - plan.fade;
+        if (untilStart <= AM_LEAD) amStartTransition(ctx.currentTime + Math.max(0.15, untilStart), beats);
+    }
+
+    function amStart() {
+        if (am.on) return;
+        resumeAudio();
+        am.on = true;
+        am.played = {};
+        am.next = null;
+        am.fade = null;
+        var playing = decks.filter(function (d) { return d.playing; });
+        if (playing.length) {
+            // continue from the deck that is currently heard most
+            var cur = playing.length === 2 ? (xf.value < 0.5 ? 0 : 1) : decks.indexOf(playing[0]);
+            am.cur = cur;
+            if (playing.length === 2) amDeck(amOther(cur)).pause();
+            if (amDeck(cur).item) am.played[amDeck(cur).item.Id] = true;
+            setCrossfader(cur === 0 ? 0 : 1);
+            amSetStatus();
+            amPrepareNext();
+        } else {
+            am.cur = -1;          // no current track: the list starts at the top
+            am.listIndex = -1;
+            am.nextLoading = true;
+            amSetStatus();
+            // amPickFromList() also skips very short tracks (interludes)
+            var first = $('#amMode').value === 'random' ? amPickRandom() : amPickFromList();
+            first.then(function (item) {
+                am.cur = 0;
+                if (!am.on) return null;
+                if (!item) { toast(t('amNoTrack')); amStop(); return null; }
+                return decks[0].load(item).then(function (ok) { return ok ? item : null; });
+            }).then(function (item) {
+                am.nextLoading = false;
+                if (!am.on || !item) { amSetStatus(); return; }
+                am.played[item.Id] = true;
+                setCrossfader(0);
+                decks[0].playAt(audibleBounds(decks[0]).start, ctx.currentTime + 0.05);
+                amSetStatus();
+                amPrepareNext();
+            });
+        }
+        clearInterval(am.timer);
+        am.timer = setInterval(amTick, 250);
+    }
+
+    function amStop(manual) {
+        if (!am.on) return;
+        am.on = false;
+        clearInterval(am.timer);
+        clearInterval(am.glideTimer);
+        clearTimeout(am.finishTimer);
+        if (am.fade) {
+            // freeze the crossfader where the transition currently is
+            var p = clamp((ctx.currentTime - am.fade.T) / am.fade.dur, 0, 1);
+            var to = am.fade.to;
+            decks.forEach(function (d) { d.xf.gain.cancelScheduledValues(ctx.currentTime); });
+            setCrossfader(to === 0 ? 1 - p : p);
+            am.fade = null;
+        }
+        am.next = null;
+        am.nextLoading = false;
+        amSetStatus();
+        if (manual) toast(t('amStopped'));
+    }
+
+    // manual control of transport / crossfader / loading takes over from the Auto-Mix
+    function manual() { if (am.on) amStop(true); }
+
+    function amSkip() {
+        if (!am.on) return;
+        if (am.fade) return;
+        if (!am.next) { toast(t('amLoading')); return; }
+        amStartTransition(ctx.currentTime + 0.15, 4);
+    }
+
+    // crossfader position while a transition runs (display only)
+    function amRender() {
+        if (!am.fade) return;
+        var p = clamp((ctx.currentTime - am.fade.T) / am.fade.dur, 0, 1);
+        var v = am.fade.to === 0 ? 1 - p : p;
+        if (ctx.currentTime >= am.fade.T) { xf.value = v; $('#crossfader').value = v; }
+    }
+
+    function bindAutoMix() {
+        $('#amBtn').addEventListener('click', function () { if (am.on) amStop(); else amStart(); });
+        $('#amSkip').addEventListener('click', amSkip);
+        $('#amMode').addEventListener('change', function () {
+            // a different mode only affects the track after the one already loaded
+            amSetStatus();
+        });
+        amSetStatus();
+    }
+
+    // =====================================================================================
     // Keyboard
     // =====================================================================================
     var KEYMAP = {
-        KeyQ: [0, 'cue'], KeyW: [0, 'play'], KeyE: [0, 'sync'], KeyR: [0, 'loop'], KeyA: [0, 'nudgeDown'], KeyS: [0, 'nudgeUp'], KeyF: [0, 'fx'], KeyZ: [0, 'backspin'], KeyX: [0, 'brake'],
+        KeyQ: [0, 'cue'], KeyW: [0, 'play'], KeyE: [0, 'sync'], KeyR: [0, 'loop'], KeyA: [0, 'nudgeDown'], KeyS: [0, 'nudgeUp'], KeyF: [0, 'fx'], KeyZ: [0, 'backspin'], KeyX: [0, 'brake'], KeyC: [0, 'forwardspin'],
         Digit1: [0, 'hc0'], Digit2: [0, 'hc1'], Digit3: [0, 'hc2'], Digit4: [0, 'hc3'],
-        KeyO: [1, 'cue'], KeyP: [1, 'play'], KeyI: [1, 'sync'], KeyU: [1, 'loop'], KeyK: [1, 'nudgeDown'], KeyL: [1, 'nudgeUp'], KeyJ: [1, 'fx'], KeyM: [1, 'backspin'], Comma: [1, 'brake'],
+        KeyO: [1, 'cue'], KeyP: [1, 'play'], KeyI: [1, 'sync'], KeyU: [1, 'loop'], KeyK: [1, 'nudgeDown'], KeyL: [1, 'nudgeUp'], KeyJ: [1, 'fx'], KeyM: [1, 'backspin'], Comma: [1, 'brake'], Period: [1, 'forwardspin'],
         Digit7: [1, 'hc0'], Digit8: [1, 'hc1'], Digit9: [1, 'hc2'], Digit0: [1, 'hc3']
     };
 
@@ -2611,6 +3144,7 @@
             if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
                 e.preventDefault();
                 var dir = e.code === 'ArrowLeft' ? -1 : 1;
+                manual();
                 setCrossfader(e.shiftKey ? (dir < 0 ? 0 : 1) : xf.value + dir * 0.05);
                 return;
             }
@@ -2619,13 +3153,14 @@
             e.preventDefault();
             var d = decks[m[0]], act = m[1];
             if (e.repeat && act !== 'nudgeDown' && act !== 'nudgeUp') return;
-            if (act === 'cue') d.cueDown();
-            else if (act === 'play') d.togglePlay();
+            if (act === 'cue') { manual(); d.cueDown(); }
+            else if (act === 'play') { manual(); d.togglePlay(); }
             else if (act === 'sync') d.syncTo(d.other);
             else if (act === 'loop') d.toggleBeatLoop();
             else if (act === 'fx') d.toggleFx();
             else if (act === 'backspin') d.backspin();
             else if (act === 'brake') d.brake();
+            else if (act === 'forwardspin') d.forwardspin();
             else if (act === 'nudgeDown') d.setNudge(0.96);
             else if (act === 'nudgeUp') d.setNudge(1.04);
             else if (act.indexOf('hc') === 0) {
@@ -2663,6 +3198,7 @@
             decks[1].render();
             drawBand();
             renderSamplerFrame();
+            amRender();
             drawVu($('#masterVu'), masterAnalyser, masterVuData, masterVuState);
             toggle($('#limiterLed'), 'on', limiter.reduction < -1);
         } catch (e) {
@@ -2757,8 +3293,8 @@
         bindBand();
         bindSampler();
         initKnob($('#masterKnob'), 0.8, function (v) { smooth(masterGain.gain, v * v / 0.64); });
-        $('#crossfader').addEventListener('input', function () { setCrossfader(+$('#crossfader').value); });
-        $('#crossfader').addEventListener('dblclick', function () { setCrossfader(0.5); });
+        $('#crossfader').addEventListener('input', function () { manual(); setCrossfader(+$('#crossfader').value); });
+        $('#crossfader').addEventListener('dblclick', function () { manual(); setCrossfader(0.5); });
         $('#xfCurve').addEventListener('change', function () { xf.curve = $('#xfCurve').value; applyCrossfader(); });
         setCrossfader(0.5);
 
@@ -2775,6 +3311,19 @@
         $('#helpClose').addEventListener('click', function () { $('#help').classList.add('hidden'); });
 
         bindLibrary();
+        bindColumns();
+        bindAutoMix();
+        toggle($('#autoGainBtn'), 'on', autoGain);
+        $('#autoGainBtn').addEventListener('click', function () {
+            autoGain = !autoGain;
+            try { localStorage.setItem('embydj-autogain', autoGain ? 'on' : 'off'); } catch (e) { /* ignore */ }
+            toggle($('#autoGainBtn'), 'on', autoGain);
+            decks.forEach(function (d) { d.applyAutoGain(); });
+        });
+        // no browser context menu except in text fields (pads, hot cues and the table header have their own)
+        document.addEventListener('contextmenu', function (e) {
+            if (!e.target.closest('input[type=search], input[type=text], textarea')) e.preventDefault();
+        });
         bindKeyboard();
         requestAnimationFrame(frame);
 

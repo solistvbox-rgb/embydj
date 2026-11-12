@@ -195,8 +195,8 @@ select { background: var(--panel2); border: 1px solid var(--line); border-radius
 .lib-table td { padding: 3px 6px; border-bottom: 1px solid #1f2229; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lib-table tr { cursor: default; }
 .lib-table tbody tr:hover { background: var(--panel2); }
-.lib-table tr.loaded-a td:nth-child(3) { color: var(--a); }
-.lib-table tr.loaded-b td:nth-child(3) { color: var(--b); }
+.lib-table tr.loaded-a td.col-title { color: var(--a); }
+.lib-table tr.loaded-b td.col-title { color: var(--b); }
 .lib-table th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
 .lib-table th.sortable:hover { color: var(--text); }
 .lib-table th.sorted { color: var(--text); }
@@ -357,6 +357,36 @@ th.sorted.desc .sort-arrow::before { content: "\25BC\FE0E"; }
 #deckB .spin-btns { order: 2; }
 .spin-btns .btn.tiny { width: 52px; padding: 3px 0; font-size: 9px; font-weight: 700; letter-spacing: .3px; min-width: 0; }
 .spin-btns .btn.on { background: var(--deck); border-color: var(--deck); color: #fff; }
+
+/* ---- library: track number, genre, column chooser ---- */
+.lib-table .c-track { width: 46px; }
+.lib-table .col-genre { width: 14%; }
+.lib-table th.disabled { cursor: default; }
+.lib-table th.disabled .sort-arrow { opacity: .12; }
+.lib-table.hide-cover .col-cover, .lib-table.hide-track .col-track, .lib-table.hide-artist .col-artist,
+.lib-table.hide-album .col-album, .lib-table.hide-genre .col-genre, .lib-table.hide-bpm .col-bpm,
+.lib-table.hide-time .col-time { display: none; }
+.col-menu label { display: flex; align-items: center; gap: 8px; padding: 4px 8px; cursor: pointer; border-radius: 4px; }
+.col-menu label:hover { background: var(--panel3); }
+
+/* ---- tempo: back-to-0 button at the centre of the pitch fader ---- */
+.pitch-scale::after { display: none; }
+.pitch-zero { position: absolute; top: 50%; right: -7px; width: 13px; height: 13px; margin-top: -6px; padding: 0;
+  border-radius: 50%; border: 2px solid #0c0d11; background: #8b90a0; cursor: pointer; z-index: 1; }
+.pitch-zero:hover { background: var(--deck); }
+#deckB .pitch-zero { right: auto; left: -7px; }
+#deckB .pitch-scale::before { left: auto; right: -3px; }
+
+/* ---- Auto-Gain ---- */
+#autoGainBtn { font-size: 10px; font-weight: 700; letter-spacing: .4px; }
+#autoGainBtn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* ---- Auto-Mix ---- */
+.automix { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.automix select { font-size: 11px; padding: 2px; }
+#amBtn { font-weight: 800; letter-spacing: .5px; }
+#amBtn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.am-next { color: var(--dim); font-size: 11px; max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* narrower windows: drop the cover and slim the side column */
 @media (max-width: 1350px) {

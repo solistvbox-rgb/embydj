@@ -37,7 +37,8 @@ opens it full-window.
 ### Decks
 
 - Two decks with play/pause, CUE (hold to preview), SYNC (tempo and beat phase) and 6 hot cues
-- Vertical pitch fader (±8 / ±16 / ±50 %), pitch bend buttons
+- Vertical pitch fader (±8 / ±16 / ±50 %) with a button back to 0 %, pitch bend buttons; loading a track resets
+  the tempo
 - Beat loops (1/8 to 64 beats) with loop in/out, loops snap to the beat grid
 - Automatic **BPM and first-beat detection**; correct it with /2, x2 or TAP
 - BPM, beat grid, cue and hot cues are saved on the server and are back the next time the track is loaded
@@ -57,14 +58,28 @@ opens it full-window.
   tempo while playing
 - **SLIP** mode: after a scratch, backspin or brake the track continues where it would have been - you stay in
   time
-- **Backspin**: flick the platter backwards and let go, or press **⟲ BACK** (beat-synced length)
+- **Backspin** and **forward spin**: flick the platter backwards or forwards and let go, or press **⟲ BACK** /
+  **FWD ⟳** (beat-synced length)
 - **Brake**: the platter slows down to a stop
 - Click-free jumps (hot cues, seek, loop wrap) and click-free start/stop
+
+### Auto-Mix
+
+- **AUTO** plays one track after another: the next track is preloaded on the free deck and mixed in before the
+  current one ends
+- Next track from the **list** (current source, search and sort order) or at **random**
+- Tracks with a similar tempo (max. 8 % apart) are beat-matched (tempo and beat phase) with a transition of 4, 8, 16
+  or 32 beats; otherwise a plain crossfade. Silence at the start and end of a track is skipped
+- **SKIP** mixes to the next track right away; the top bar shows the next track
+- Any manual play, cue, load or crossfader move stops the Auto-Mix
 
 ### Mixer
 
 - Per channel: gain, 3-band EQ with kill switches, filter (left = low-pass, right = high-pass), channel fader
   and VU meter
+- **Auto-Gain**: measures the loudness of each track (similar to LUFS / ReplayGain) and sets the channel gain so
+  that all tracks play at about the same level (max. +9 dB boost, the limiter catches peaks); switch it off with
+  **AUTO GAIN** in the top bar. The gain can still be adjusted by hand
 - Crossfader with smooth or sharp curve, master volume, master VU meter and limiter indicator
 
 ### Effects
@@ -88,9 +103,13 @@ effect is switched off, even with the channel fader closed.
 ### Library
 
 - All tracks, music libraries and playlists
-- Search across **title, artist and album**
-- Click the **Title, Artist, Album or BPM** column header to sort (click again for descending); date added and
-  random order are in the sort menu. Sorting by BPM lists all tracks with a known BPM first.
+- Search across **title, artist, album and genre**
+- Columns: cover, track number, title, artist, album, genre, BPM and time - choose them with **Columns** or a
+  right-click on the table header
+- Click the **Title, Artist, Album, Genre or BPM** column header to sort (click again for descending); date added and
+  random order are in the sort menu. Sorting by BPM lists all tracks with a known BPM first; sorting by genre lists the genres alphabetically
+  (tracks without a genre at the end). Sorting by **track
+  number** works when the list contains a single album.
 - Load a track with the A/B buttons, a double-click or drag & drop onto a deck
 
 ### Keyboard shortcuts
@@ -104,7 +123,7 @@ effect is switched off, even with the channel fader closed.
 | Hot cues 1-4 | 1 2 3 4 | 7 8 9 0 |
 | Pitch bend −/+ | A / S | K / L |
 | FX on/off | F | J |
-| Backspin / Brake | Z / X | M / , |
+| Backspin / Brake / Forward spin | Z / X / C | M / , / . |
 | Crossfader | ← / → (Shift = full) | |
 | Sampler pads | Numpad 7 8 9 / 4 5 6 / 1 2 3 | |
 
@@ -120,7 +139,7 @@ effect is switched off, even with the channel fader closed.
 - EmbyDJ talks only to your own Emby server. It uses the session of the signed-in administrator; no external
   services are contacted. All data routes require an administrator.
 - Data is stored in `<programdata>/data/`:
-  - `embydj-tracks.json` - BPM, beat grid, cue and hot cues per track, **shared by all administrators**.
+  - `embydj-tracks.json` - BPM, beat grid, cue, hot cues and loudness per track, **shared by all administrators**.
   - `embydj-sampler/<userId>/` - the sampler pads (`pads.json`) and uploaded samples of each administrator.
     Samples are limited to 10 MB each; replaced or cleared samples are deleted.
 - Effect settings and the VINYL/SLIP state are kept in the browser (local storage), the chosen sample folder in

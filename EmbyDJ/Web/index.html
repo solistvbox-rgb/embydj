@@ -12,10 +12,26 @@
       <div class="brand">Emby<b>DJ</b></div>
       <div class="version" id="version"></div>
       <div class="topbar-info" id="status"></div>
+      <div class="automix">
+        <button class="btn small" id="amBtn" title="Auto-Mix: plays one track after another with beat-matched transitions">AUTO</button>
+        <select id="amMode" title="Order of the next tracks">
+          <option value="list">List</option>
+          <option value="random">Random</option>
+        </select>
+        <select id="amLen" title="Transition length (synced transitions)">
+          <option value="4">4 beats</option>
+          <option value="8">8 beats</option>
+          <option value="16" selected>16 beats</option>
+          <option value="32">32 beats</option>
+        </select>
+        <button class="btn small" id="amSkip" title="Mix to the next track now">SKIP</button>
+        <span class="am-next" id="amNext"></span>
+      </div>
       <div class="master-box" title="Master">
         <span class="mb-label">MASTER</span>
         <canvas class="master-vu" id="masterVu"></canvas>
         <span class="limiter-led" id="limiterLed" title="Limiter">LIMIT</span>
+        <button class="btn small" id="autoGainBtn" title="Auto-Gain: sets the channel GAIN so that every track plays at about the same loudness">AUTO GAIN</button>
         <div class="knob small" id="masterKnob" title="Master volume (double-click resets)"></div>
       </div>
       <button class="btn small hidden" id="newTabBtn" data-i18n="newTab">Open in new tab</button>
@@ -110,6 +126,7 @@
               <div class="jog-wrap">
                 <div class="spin-btns">
                   <button class="btn tiny backspin-btn" title="Backspin (also: flick the platter backwards and let go)">&#10226; BACK</button>
+                  <button class="btn tiny fwdspin-btn" title="Forward spin (also: flick the platter forwards and let go)">FWD &#10227;</button>
                   <button class="btn tiny brake-btn" title="Brake: the platter slows down to a stop">BRAKE</button>
                 </div>
                 <canvas class="jog" title="Jog wheel: drag to scrub (paused) or bend the tempo (playing)"></canvas>
@@ -121,6 +138,7 @@
                 <div class="pitch-scale">
                   <span>+</span>
                   <input type="range" class="tempo-fader" min="-1" max="1" step="0.0005" value="0" title="Tempo (double-click resets)">
+                  <button class="pitch-zero" title="Tempo back to 0 %"></button>
                   <span>&#8722;</span>
                 </div>
                 <div class="pitch-btns">
@@ -187,28 +205,33 @@
     <section class="library">
       <div class="lib-toolbar">
         <select id="libSource"></select>
-        <input type="search" id="libSearch" placeholder="Search title, artist, album…" data-i18n-placeholder="search">
+        <input type="search" id="libSearch" placeholder="Search title, artist, album, genre…" data-i18n-placeholder="search">
         <select id="libSort">
           <option value="SortName" data-i18n="sortTitle">Title</option>
           <option value="AlbumArtist,Album,SortName" data-i18n="sortArtist">Artist</option>
           <option value="Album,ParentIndexNumber,IndexNumber" data-i18n="sortAlbum">Album</option>
           <option value="Bpm">BPM</option>
+          <option value="Genre">Genre</option>
+          <option value="ParentIndexNumber,IndexNumber,SortName" hidden>Track #</option>
           <option value="DateCreated" data-i18n="sortAdded">Recently added</option>
           <option value="Random" data-i18n="sortRandom">Random</option>
         </select>
         <span id="libCount"></span>
+        <button class="btn small" id="colBtn" title="Choose columns (also: right-click the table header)">Columns &#9662;</button>
       </div>
       <div class="lib-table-wrap" id="libWrap">
         <table class="lib-table">
           <thead>
             <tr>
               <th class="c-load"></th>
-              <th class="c-cover"></th>
-              <th class="sortable" data-sort="SortName"><span data-i18n="colTitle">Title</span><span class="sort-arrow"></span></th>
-              <th class="sortable" data-sort="AlbumArtist,Album,SortName"><span data-i18n="colArtist">Artist</span><span class="sort-arrow"></span></th>
-              <th class="sortable" data-sort="Album,ParentIndexNumber,IndexNumber"><span data-i18n="colAlbum">Album</span><span class="sort-arrow"></span></th>
-              <th class="c-num sortable" data-sort="Bpm"><span class="sort-arrow"></span><span>BPM</span></th>
-              <th class="c-num" data-i18n="colTime">Time</th>
+              <th class="c-cover col-cover"></th>
+              <th class="c-num c-track col-track sortable" data-sort="ParentIndexNumber,IndexNumber,SortName"><span class="sort-arrow"></span><span>#</span></th>
+              <th class="col-title sortable" data-sort="SortName"><span data-i18n="colTitle">Title</span><span class="sort-arrow"></span></th>
+              <th class="col-artist sortable" data-sort="AlbumArtist,Album,SortName"><span data-i18n="colArtist">Artist</span><span class="sort-arrow"></span></th>
+              <th class="col-album sortable" data-sort="Album,ParentIndexNumber,IndexNumber"><span data-i18n="colAlbum">Album</span><span class="sort-arrow"></span></th>
+              <th class="col-genre sortable" data-sort="Genre"><span>Genre</span><span class="sort-arrow"></span></th>
+              <th class="c-num col-bpm sortable" data-sort="Bpm"><span class="sort-arrow"></span><span>BPM</span></th>
+              <th class="c-num col-time" data-i18n="colTime">Time</th>
             </tr>
           </thead>
           <tbody id="libBody"></tbody>
@@ -235,6 +258,17 @@
   </div>
 
   <div id="toast" class="toast"></div>
+
+  <div id="colMenu" class="pad-menu col-menu hidden">
+    <div class="pm-title">Columns</div>
+    <label><input type="checkbox" value="cover"> Cover</label>
+    <label><input type="checkbox" value="track"> Track #</label>
+    <label><input type="checkbox" value="artist"> Artist</label>
+    <label><input type="checkbox" value="album"> Album</label>
+    <label><input type="checkbox" value="genre"> Genre</label>
+    <label><input type="checkbox" value="bpm"> BPM</label>
+    <label><input type="checkbox" value="time"> Time</label>
+  </div>
 
   <div id="padMenu" class="pad-menu hidden">
     <div class="pm-title"></div>
@@ -284,7 +318,7 @@
         <tr><td>Beat loop</td><td>R</td><td>U</td></tr>
         <tr><td>Pitch bend −/+</td><td>A / S</td><td>K / L</td></tr>
         <tr><td>FX on/off</td><td>F</td><td>J</td></tr>
-        <tr><td>Backspin / Brake</td><td>Z / X</td><td>M / ,</td></tr>
+        <tr><td>Backspin / Brake / Forward spin</td><td>Z / X / C</td><td>M / , / .</td></tr>
         <tr><td>Sampler pads</td><td colspan="2">Numpad 7 8 9 / 4 5 6 / 1 2 3</td></tr>
         <tr><td>Crossfader</td><td colspan="2">← / →  (Shift = full)</td></tr>
       </table>
