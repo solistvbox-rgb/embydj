@@ -1,0 +1,51 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Emby Server plugins MUST target netstandard2.0 (Emby's plugin loader).
+    Built against mediabrowser.server.core 4.8.0.80 - runs on Emby 4.9 - 4.11.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <AssemblyName>EmbyDJ</AssemblyName>
+    <RootNamespace>EmbyDJ</RootNamespace>
+    <!-- Bump on every release, also for web-only changes: the web app is loaded with ?v=<version>. -->
+    <Version>0.2.0.3</Version>
+    <AssemblyVersion>0.2.0.3</AssemblyVersion>
+    <FileVersion>0.2.0.3</FileVersion>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!--
+      Only EmbyDJ.dll is needed by Emby. No debug file (.pdb): the compiler would embed its build
+      path (including the user folder) in the DLL. Deterministic + PathMap: identical sources give a
+      byte-identical DLL without local paths. No .deps.json (Emby does not use it).
+    -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=.</PathMap>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <Nullable>disable</Nullable>
+
+    <!--
+      Optional: copy the plugin into the plugins folder of an Emby Server after every build, e.g.
+      dotnet build EmbyDJ -c Release -p:EmbyPluginsPath=<programdata>\plugins
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="mediabrowser.server.core" Version="4.8.0.80" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Dashboard shell (served by Emby) and the DJ web app (served by EmbyDJApi). -->
+    <EmbeddedResource Include="Web\**" />
+    <EmbeddedResource Include="thumb.webp" />
+  </ItemGroup>
+
+  <Target Name="CopyToEmbyPlugins" AfterTargets="Build" Condition="'$(EmbyPluginsPath)' != ''">
+    <Copy SourceFiles="$(TargetDir)EmbyDJ.dll" DestinationFolder="$(EmbyPluginsPath)" />
+  </Target>
+
+</Project>

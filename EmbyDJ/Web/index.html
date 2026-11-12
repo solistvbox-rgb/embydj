@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EmbyDJ</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">Emby<b>DJ</b></div>
+      <div class="version" id="version"></div>
+      <div class="topbar-info" id="status"></div>
+      <div class="master-box" title="Master">
+        <span class="mb-label">MASTER</span>
+        <canvas class="master-vu" id="masterVu"></canvas>
+        <span class="limiter-led" id="limiterLed" title="Limiter">LIMIT</span>
+        <div class="knob small" id="masterKnob" title="Master volume (double-click resets)"></div>
+      </div>
+      <button class="btn small hidden" id="newTabBtn" data-i18n="newTab">Open in new tab</button>
+      <button class="btn small" id="helpBtn" title="Keyboard shortcuts">?</button>
+    </header>
+
+    <!-- Shared waveform band: deck A (top lane) and deck B (bottom lane), common playhead -->
+    <section class="band">
+      <div class="band-side" id="bandSideA">
+        <div class="band-letter">A</div>
+        <div class="band-times">
+          <div class="band-label" data-i18n="remain">REMAIN</div>
+          <div class="band-remain">-0:00.0</div>
+          <div class="band-elapsed">0:00.0</div>
+        </div>
+      </div>
+      <div class="band-wave-wrap"><canvas id="bandWave" title="Drag = scrub, wheel = zoom"></canvas></div>
+      <div class="band-side right" id="bandSideB">
+        <div class="band-times">
+          <div class="band-label" data-i18n="remain">REMAIN</div>
+          <div class="band-remain">-0:00.0</div>
+          <div class="band-elapsed">0:00.0</div>
+        </div>
+        <div class="band-letter">B</div>
+      </div>
+    </section>
+
+    <section class="decks">
+      <!-- Deck template, cloned twice by app.js (deck B is mirrored via CSS) -->
+      <template id="deckTemplate">
+        <div class="deck">
+          <aside class="deck-side">
+            <div class="panel">
+              <div class="panel-title">HOT CUE</div>
+              <div class="hotcues">
+                <button class="btn hotcue" data-i="0">1</button>
+                <button class="btn hotcue" data-i="1">2</button>
+                <button class="btn hotcue" data-i="2">3</button>
+                <button class="btn hotcue" data-i="3">4</button>
+                <button class="btn hotcue" data-i="4">5</button>
+                <button class="btn hotcue" data-i="5">6</button>
+              </div>
+            </div>
+            <div class="panel">
+              <div class="panel-title" data-i18n="effect">EFFECT</div>
+              <div class="fx-top">
+                <select class="fx-type" title="Effect"></select>
+                <button class="btn fx-on" title="Effect on/off">ON</button>
+              </div>
+              <div class="fx-knobs">
+                <div class="knob small" data-fx="dw" title="Dry / Wet"><span>D/W</span></div>
+                <div class="knob small" data-fx="p1" title="Parameter 1"><span>P1</span></div>
+                <div class="knob small" data-fx="p2" title="Parameter 2"><span>P2</span></div>
+              </div>
+              <div class="fx-value"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-title">LOOP</div>
+              <div class="loop-len-row">
+                <button class="btn loop-half" title="Halve loop length">&#9664;</button>
+                <button class="btn loop-toggle" title="Beat loop on/off"><span class="loop-len">4</span></button>
+                <button class="btn loop-double" title="Double loop length">&#9654;</button>
+              </div>
+              <div class="loop-io">
+                <button class="btn loop-in" title="Loop in">IN</button>
+                <button class="btn loop-out" title="Loop out">OUT</button>
+                <button class="btn loop-pad" title="Save the active loop to the next free sampler pad">&#8594;PAD</button>
+              </div>
+            </div>
+          </aside>
+
+          <div class="deck-main">
+            <div class="deck-head">
+              <img class="cover" alt="">
+              <div class="meta">
+                <div class="title" data-i18n="noTrack">No track loaded</div>
+                <div class="artist"></div>
+              </div>
+              <div class="bpmbox">
+                <div class="bpm-line"><span class="bpm">---</span><button class="btn tiny bpm-tap" title="Tap tempo">TAP</button></div>
+                <div class="bpm-sub">
+                  <span>BPM</span>
+                  <button class="btn tiny bpm-half" title="BPM / 2">/2</button>
+                  <button class="btn tiny bpm-double" title="BPM x 2">x2</button>
+                </div>
+              </div>
+            </div>
+
+            <canvas class="wave-overview" title="Click / drag = seek"></canvas>
+
+            <div class="deck-center">
+              <div class="jog-wrap">
+                <div class="spin-btns">
+                  <button class="btn tiny backspin-btn" title="Backspin (also: flick the platter backwards and let go)">&#10226; BACK</button>
+                  <button class="btn tiny brake-btn" title="Brake: the platter slows down to a stop">BRAKE</button>
+                </div>
+                <canvas class="jog" title="Jog wheel: drag to scrub (paused) or bend the tempo (playing)"></canvas>
+              </div>
+              <div class="pitch">
+                <button class="btn tiny vinyl-btn" title="Vinyl mode: touching the platter scratches">VINYL</button>
+                <button class="btn tiny slip-btn" title="Slip mode: after a scratch the track continues where it would have been">SLIP</button>
+                <div class="pitch-value">+0.00%</div>
+                <div class="pitch-scale">
+                  <span>+</span>
+                  <input type="range" class="tempo-fader" min="-1" max="1" step="0.0005" value="0" title="Tempo (double-click resets)">
+                  <span>&#8722;</span>
+                </div>
+                <div class="pitch-btns">
+                  <button class="btn tiny nudge-down" title="Pitch bend down (hold)">&#8722;</button>
+                  <button class="btn tiny nudge-up" title="Pitch bend up (hold)">+</button>
+                </div>
+                <select class="tempo-range" title="Tempo range">
+                  <option value="0.08">&#177;8%</option>
+                  <option value="0.16">&#177;16%</option>
+                  <option value="0.5">&#177;50%</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="transport">
+              <button class="btn cue" title="Cue">CUE</button>
+              <button class="btn play" title="Play / Pause">&#9654;&#10074;&#10074;</button>
+              <button class="btn sync" title="Sync tempo and beat phase to the other deck">SYNC</button>
+            </div>
+
+            <div class="loading"><div class="loading-bar"></div><span class="loading-text"></span></div>
+          </div>
+        </div>
+      </template>
+
+      <div id="deckA"></div>
+
+      <div class="mixer">
+        <template id="channelTemplate">
+          <div class="channel">
+            <div class="ch-eq">
+              <div class="eq-row"><div class="knob" data-param="high" title="High (dB)"><span>HIGH</span></div><button class="btn kill" data-band="high" title="Kill">K</button></div>
+              <div class="eq-row"><div class="knob" data-param="mid" title="Mid (dB)"><span>MID</span></div><button class="btn kill" data-band="mid" title="Kill">K</button></div>
+              <div class="eq-row"><div class="knob" data-param="low" title="Low (dB)"><span>LOW</span></div><button class="btn kill" data-band="low" title="Kill">K</button></div>
+              <div class="eq-row"><div class="knob" data-param="filter" title="Filter: left = low-pass, right = high-pass"><span>FILTER</span></div></div>
+            </div>
+            <div class="ch-main">
+              <div class="ch-label"></div>
+              <div class="knob" data-param="trim" title="Gain (dB)"><span>GAIN</span></div>
+              <input type="range" class="ch-fader" min="0" max="1" step="0.001" value="0.85" title="Channel volume (double-click resets)">
+            </div>
+          </div>
+        </template>
+        <div class="mixer-cols">
+          <div id="chA"></div>
+          <div class="vu-pair"><canvas class="vu" id="vuA"></canvas><canvas class="vu" id="vuB"></canvas></div>
+          <div id="chB"></div>
+        </div>
+        <div class="xfader-box">
+          <span class="xf-a">A</span>
+          <input type="range" id="crossfader" min="0" max="1" step="0.001" value="0.5" title="Crossfader (double-click centers)">
+          <span class="xf-b">B</span>
+          <select id="xfCurve" title="Crossfader curve">
+            <option value="smooth">Smooth</option>
+            <option value="sharp">Sharp</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="deckB"></div>
+    </section>
+
+    <div class="lower">
+    <section class="library">
+      <div class="lib-toolbar">
+        <select id="libSource"></select>
+        <input type="search" id="libSearch" placeholder="Search title, artist, album…" data-i18n-placeholder="search">
+        <select id="libSort">
+          <option value="SortName" data-i18n="sortTitle">Title</option>
+          <option value="AlbumArtist,Album,SortName" data-i18n="sortArtist">Artist</option>
+          <option value="Album,ParentIndexNumber,IndexNumber" data-i18n="sortAlbum">Album</option>
+          <option value="Bpm">BPM</option>
+          <option value="DateCreated" data-i18n="sortAdded">Recently added</option>
+          <option value="Random" data-i18n="sortRandom">Random</option>
+        </select>
+        <span id="libCount"></span>
+      </div>
+      <div class="lib-table-wrap" id="libWrap">
+        <table class="lib-table">
+          <thead>
+            <tr>
+              <th class="c-load"></th>
+              <th class="c-cover"></th>
+              <th class="sortable" data-sort="SortName"><span data-i18n="colTitle">Title</span><span class="sort-arrow"></span></th>
+              <th class="sortable" data-sort="AlbumArtist,Album,SortName"><span data-i18n="colArtist">Artist</span><span class="sort-arrow"></span></th>
+              <th class="sortable" data-sort="Album,ParentIndexNumber,IndexNumber"><span data-i18n="colAlbum">Album</span><span class="sort-arrow"></span></th>
+              <th class="c-num sortable" data-sort="Bpm"><span class="sort-arrow"></span><span>BPM</span></th>
+              <th class="c-num" data-i18n="colTime">Time</th>
+            </tr>
+          </thead>
+          <tbody id="libBody"></tbody>
+        </table>
+        <div id="libMore" class="lib-more"></div>
+      </div>
+    </section>
+
+    <aside class="sampler">
+      <div class="smp-head">
+        <span class="smp-title">SAMPLER</span>
+        <button class="btn tiny" id="smpPrev" title="Previous bank">&#9664;</button>
+        <span id="smpBank">Bank 1</span>
+        <button class="btn tiny" id="smpNext" title="Next bank">&#9654;</button>
+        <span class="smp-spacer"></span>
+        <button class="btn tiny" id="smpFolder" title="Browse a local sample folder">Folder…</button>
+        <button class="btn tiny" id="smpStop" title="Stop all pads">&#9632;</button>
+        <div class="knob small" id="smpVol" title="Sampler volume (double-click resets)"></div>
+      </div>
+      <div class="smp-grid" id="smpGrid"></div>
+      <input type="file" id="smpFile" accept="audio/*,.wav,.mp3,.flac,.ogg,.opus,.m4a,.aac,.aif,.aiff" multiple class="hidden">
+    </aside>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <div id="padMenu" class="pad-menu hidden">
+    <div class="pm-title"></div>
+    <button class="pm-item pm-load">Load file…</button>
+    <button class="pm-item pm-folder">Browse folder…</button>
+    <div class="pm-needs-pad">
+      <div class="pm-row">
+        <button class="pm-mode" data-mode="oneshot" title="Plays once per press">One-shot</button>
+        <button class="pm-mode" data-mode="hold" title="Plays while held">Hold</button>
+        <button class="pm-mode" data-mode="loop" title="Loops until pressed again">Loop</button>
+      </div>
+      <label class="pm-label">Volume <input type="range" class="pm-vol" min="0" max="1.2" step="0.01"></label>
+      <div class="pm-colors"></div>
+      <button class="pm-item pm-rename">Rename…</button>
+      <button class="pm-item pm-clear">Clear pad</button>
+    </div>
+  </div>
+
+  <div id="folderModal" class="modal hidden">
+    <div class="modal-box folder-box">
+      <div class="fb-head">
+        <h3>Sample folder</h3>
+        <span class="fb-path" id="fbPath"></span>
+      </div>
+      <div class="fb-tools">
+        <button class="btn small" id="fbChoose">Choose folder…</button>
+        <button class="btn small hidden" id="fbReconnect">Allow access again</button>
+        <button class="btn small" id="fbUp">&#8593; Up</button>
+        <span class="fb-hint">Drag files onto a pad, or use &#8594; Pad.</span>
+      </div>
+      <div class="fb-list" id="fbList"></div>
+      <div class="fb-empty" id="fbEmpty"></div>
+      <div class="fb-foot"><button class="btn" id="fbClose">Close</button></div>
+    </div>
+  </div>
+
+  <div id="help" class="modal hidden">
+    <div class="modal-box">
+      <h3 data-i18n="shortcuts">Keyboard shortcuts</h3>
+      <table class="keys">
+        <tr><th></th><th>Deck A</th><th>Deck B</th></tr>
+        <tr><td>Cue</td><td>Q</td><td>O</td></tr>
+        <tr><td>Play / Pause</td><td>W</td><td>P</td></tr>
+        <tr><td>Sync</td><td>E</td><td>I</td></tr>
+        <tr><td>Hot cues 1-4</td><td>1 2 3 4</td><td>7 8 9 0</td></tr>
+        <tr><td>Jog wheel</td><td colspan="2">VINYL on: platter = scratch, outer ring = pitch bend</td></tr>
+        <tr><td>Beat loop</td><td>R</td><td>U</td></tr>
+        <tr><td>Pitch bend −/+</td><td>A / S</td><td>K / L</td></tr>
+        <tr><td>FX on/off</td><td>F</td><td>J</td></tr>
+        <tr><td>Backspin / Brake</td><td>Z / X</td><td>M / ,</td></tr>
+        <tr><td>Sampler pads</td><td colspan="2">Numpad 7 8 9 / 4 5 6 / 1 2 3</td></tr>
+        <tr><td>Crossfader</td><td colspan="2">← / →  (Shift = full)</td></tr>
+      </table>
+      <p data-i18n="hotcueHelp">Hot cue: click = set / jump, right-click = delete.</p>
+      <button class="btn" id="helpClose">OK</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
