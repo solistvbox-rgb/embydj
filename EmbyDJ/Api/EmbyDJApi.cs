@@ -57,6 +57,17 @@ namespace EmbyDJ.Api
     }
 
     [Authenticated(Roles = "Admin")]
+    [Route("/EmbyDJ/Midi/Profiles", "GET", Summary = "Saved MIDI controller profiles of the current user (JSON object, empty if none)")]
+    public class GetMidiProfiles : IReturn<object> { }
+
+    [Authenticated(Roles = "Admin")]
+    [Route("/EmbyDJ/Midi/Profiles", "POST", Summary = "Store the MIDI controller profiles of the current user (Data = JSON object)")]
+    public class SetMidiProfiles : IReturnVoid
+    {
+        public string Data { get; set; }
+    }
+
+    [Authenticated(Roles = "Admin")]
     [Route("/EmbyDJ/Sampler/Samples", "POST", Summary = "Upload a sample (raw request body, Name = original file name). Max 10 MB.")]
     public class UploadSample : IRequiresRequestStream, IReturn<object>
     {
@@ -156,6 +167,10 @@ namespace EmbyDJ.Api
         public object Get(GetPads request) => JsonResult(P.Sampler.GetPads(CurrentUserId()));
 
         public void Post(SetPads request) => P.Sampler.SetPads(CurrentUserId(), request.Data);
+
+        public object Get(GetMidiProfiles request) => JsonResult(P.Sampler.GetMidiProfiles(CurrentUserId()));
+
+        public void Post(SetMidiProfiles request) => P.Sampler.SetMidiProfiles(CurrentUserId(), request.Data);
 
         public async Task<object> Post(UploadSample request)
         {

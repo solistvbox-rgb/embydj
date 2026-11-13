@@ -15,7 +15,7 @@
             sortAlbum: 'Album', sortAdded: 'Recently added', sortRandom: 'Random', colTitle: 'Title',
             colArtist: 'Artist', colAlbum: 'Album', colTime: 'Time', shortcuts: 'Keyboard shortcuts',
             hotcueHelp: 'Hot cue: click = set / jump, right-click = delete.',
-            allTracks: 'All tracks', libraries: 'Libraries', playlists: 'Playlists', tracks: '{n} tracks',
+            allTracks: 'All tracks', libraries: 'Libraries', playlists: 'Playlists', tracks: '{n} tracks', bpmRedetected: 'BPM detected again: {b}', bpmNotDetected: 'No clear beat found in this track.',
             smpEmpty: 'empty', smpEmptyHint: 'Click: load a file · drop a track, file or folder entry · right-click: options',
             smpSaveFailed: 'Saving the pads failed: {e}', smpLoadFailed: 'Sample could not be loaded: {e}',
             smpTooLarge: 'Sample is larger than 10 MB.', smpUnsupported: 'Not a supported audio file: {n}',
@@ -1133,6 +1133,18 @@
     };
 
     // ---- BPM tools ----
+    // throw away a BPM / beat grid set by hand (/2, x2, TAP) and run the automatic detection again
+    Deck.prototype.redetectBpm = function () {
+        if (!this.wave) return;
+        var det = detectBpm(this.wave);
+        if (!det) { toast(t('bpmNotDetected')); return; }
+        this.meta.bpm = det.bpm;
+        this.meta.offset = det.offset;
+        this.meta.bpmSource = 'auto';
+        this.scheduleSave();
+        toast(t('bpmRedetected', { b: det.bpm }));
+    };
+
     Deck.prototype.scaleBpm = function (f) {
         if (!this.meta.bpm) return;
         this.meta.bpm = Math.round(this.meta.bpm * f * 100) / 100;
@@ -1326,6 +1338,7 @@
         q('.bpm-half').addEventListener('click', function () { self.scaleBpm(0.5); });
         q('.bpm-double').addEventListener('click', function () { self.scaleBpm(2); });
         q('.bpm-tap').addEventListener('click', function () { self.tap(); });
+        ui.bpm.addEventListener('dblclick', function () { self.redetectBpm(); });
 
         // tempo
         ui.tempo.addEventListener('input', function () { self.setTempo(+ui.tempo.value); });
@@ -1745,7 +1758,9 @@
         el.addEventListener('dblclick', function () { set(def); });
         el.addEventListener('wheel', function (e) { e.preventDefault(); set(value + (e.deltaY < 0 ? 0.03 : -0.03)); }, { passive: false });
         set(initial != null ? initial : def);
-        return { set: set, get: function () { return value; } };
+        var api = { set: set, get: function () { return value; } };
+        el._knob = api;   // used by MIDI control
+        return api;
     }
 
     // =====================================================================================
@@ -1813,6 +1828,7 @@
         lib.start = 0;
         lib.total = 0;
         lib.loading = false;
+        libSel = -1;
         lib.bpmPhase = lib.sort === 'Bpm' && !lib.search;
         lib.genrePhase = lib.sort === 'Genre' && !lib.search;
         lib.genre = { list: null, i: 0, start: 0 };
@@ -2836,6 +2852,8 @@
         return { start: Math.min(s / w.fps, dur), end: Math.min((e + 1) / w.fps, dur) };
     }
 
+    var AM_TITLE = 'Auto-Mix: plays one track after another with beat-matched transitions';
+
     function amSetStatus() {
         toggle($('#amBtn'), 'on', am.on);
         var label = '';
@@ -2843,8 +2861,8 @@
             if (am.next && am.next.item) label = t('amNext', { n: artistOf(am.next.item) + ' – ' + (am.next.item.Name || '') });
             else if (am.nextLoading) label = t('amLoading');
         }
-        $('#amNext').textContent = label;
-        $('#amNext').title = label;
+        // no text in the top bar (it would move the buttons) - the next track is shown as tooltip of AUTO
+        $('#amBtn').title = AM_TITLE + (label ? '\n' + label : '');
     }
 
     // ---- choosing the next track ----
@@ -3127,6 +3145,1198 @@
     }
 
     // =====================================================================================
+    // MIDI controllers (Web MIDI API - Chrome / Edge, https or localhost)
+    //   Learn mode: click a control in EmbyDJ, then move / press the control on the hardware.
+    //   Mapping: "<type>:<channel>:<number>[@mode][/A|/B]" -> { target, invert, rel }
+    //     type: note | cc | pb (pitch bend);  target: data-midi id of an EmbyDJ control or a function.
+    //     "F." targets act on the selected deck (deck switch of the controller: focus-toggle / -a / -b).
+    //     "@mode": only in that mode of the controller (mode-next, mode:<name>); "/A", "/B": only while
+    //     that deck is selected. The most specific entry wins.
+    //   Buttons react to press / release, faders and knobs take the absolute value (rel: the relative
+    //   steps of an encoder), jog wheels send relative steps.
+    // =====================================================================================
+    var MIDI_STORE = 'embydj-midi';
+    var midi = {
+        access: null, map: {}, learn: false, pending: null, relearn: null, jogScale: 1,
+        jogStepsPerRev: 400,   // messages per full turn of the hardware jog (set by the calibration)
+        calib: null,           // running calibration: { sum }
+        modes: [],             // modes of the controller (e.g. sampler, loop, fx, cue)
+        startMode: '',         // mode after loading the mapping
+        mode: '',              // current mode
+        focus: 0,              // selected deck: 0 = A, 1 = B
+        held: {},              // message -> entry of a pressed button (its release goes to the same function)
+        out: null,             // MIDI output for LEDs
+        leds: [],              // LEDs: [{ target, status, no, on, off, mode?, deck? }]
+        ledCache: {},          // last LED state sent, per "status:no"
+        ledTimer: null,
+        lastInput: '',         // name of the port that sent the last message
+        saved: {},             // saved profiles (server): name -> profile data
+        active: '',            // name of the saved profile the mapping came from
+        last: ''
+    };
+
+    // ---- control ids ----
+    var MIDI_DECK_TARGETS = {
+        '.play': 'play', '.cue': 'cue', '.sync': 'sync', '.loop-toggle': 'loop', '.loop-half': 'loop-half',
+        '.loop-double': 'loop-double', '.loop-in': 'loop-in', '.loop-out': 'loop-out', '.loop-pad': 'loop-to-pad',
+        '.backspin-btn': 'backspin', '.fwdspin-btn': 'forward-spin', '.brake-btn': 'brake', '.vinyl-btn': 'vinyl',
+        '.slip-btn': 'slip', '.nudge-down': 'bend-down', '.nudge-up': 'bend-up', '.pitch-zero': 'tempo-zero',
+        '.tempo-fader': 'tempo', '.bpm-tap': 'tap', '.fx-on': 'fx-on', '[data-fx="dw"]': 'fx-drywet',
+        '[data-fx="p1"]': 'fx-param1', '[data-fx="p2"]': 'fx-param2', '.jog': 'jog'
+    };
+    var MIDI_CHANNEL_TARGETS = {
+        '[data-param="trim"]': 'gain', '[data-param="high"]': 'eq-high', '[data-param="mid"]': 'eq-mid',
+        '[data-param="low"]': 'eq-low', '[data-param="filter"]': 'filter', '[data-band="high"]': 'kill-high',
+        '[data-band="mid"]': 'kill-mid', '[data-band="low"]': 'kill-low', '.ch-fader': 'volume'
+    };
+    // functions without a control on screen (learned from the "More functions" list)
+    var MIDI_EXTRA_TARGETS = [
+        ['focus-toggle', 'Deck switch A/B'], ['focus-a', 'Select deck A'], ['focus-b', 'Select deck B'],
+        ['lib.load-f', 'List · Load to selected deck'], ['mode-next', 'Next mode'],
+        ['F.beatjump', 'Selected deck · Beat jump (encoder)'], ['F.tempo-fine', 'Selected deck · Tempo fine (encoder)'],
+        ['F.loop-size', 'Selected deck · Loop size (encoder)'], ['F.hotcue-set-1', 'Selected deck · Set hot cue 1'],
+        ['F.hotcue-set-2', 'Selected deck · Set hot cue 2'], ['F.fx-prev', 'Selected deck · Previous effect'],
+        ['F.fx-next', 'Selected deck · Next effect']
+    ];
+
+    function tagMidiTargets() {
+        ['A', 'B'].forEach(function (id) {
+            Object.keys(MIDI_DECK_TARGETS).forEach(function (sel) {
+                var el = document.querySelector('#deck' + id + ' ' + sel);
+                if (el) el.dataset.midi = id + '.' + MIDI_DECK_TARGETS[sel];
+            });
+            document.querySelectorAll('#deck' + id + ' .hotcue').forEach(function (el, i) { el.dataset.midi = id + '.hotcue-' + (i + 1); });
+            Object.keys(MIDI_CHANNEL_TARGETS).forEach(function (sel) {
+                var el = document.querySelector('#ch' + id + ' ' + sel);
+                if (el) el.dataset.midi = id + '.' + MIDI_CHANNEL_TARGETS[sel];
+            });
+        });
+        var globals = {
+            '#crossfader': 'crossfader', '#masterKnob': 'master', '#amBtn': 'automix', '#amSkip': 'automix-skip',
+            '#autoGainBtn': 'autogain', '#smpVol': 'sampler-volume', '#smpPrev': 'sampler-bank-prev',
+            '#smpNext': 'sampler-bank-next', '#smpStop': 'sampler-stop'
+        };
+        Object.keys(globals).forEach(function (sel) { var el = $(sel); if (el) el.dataset.midi = globals[sel]; });
+        smp.els.forEach(function (el, i) { el.dataset.midi = 'pad-' + (i + 1); });
+    }
+
+    // readable name of a target, e.g. "A · Play", "A/B · Play" (selected deck), "Crossfader"
+    function midiLabel(target) {
+        var fixed = {
+            'lib.browse': 'List · Browse', 'lib.load-a': 'List · Load to A', 'lib.load-b': 'List · Load to B',
+            'lib.load-f': 'List · Load to selected deck', 'focus-toggle': 'Deck switch A/B', 'focus-a': 'Select deck A',
+            'focus-b': 'Select deck B', 'mode-next': 'Next mode'
+        };
+        if (fixed[target]) return fixed[target];
+        if (/^mode:/.test(target)) return 'Mode · ' + target.slice(5);
+        var pv = /^pad-vol-(\d+)$/.exec(target);
+        if (pv) return 'Pad ' + pv[1] + ' volume';
+        var parts = target.split('.');
+        var name = parts[parts.length - 1].replace(/-/g, ' ');
+        name = name.charAt(0).toUpperCase() + name.slice(1);
+        if (parts.length < 2) return name;
+        return (parts[0] === 'F' ? 'A/B' : parts[0]) + ' · ' + name;
+    }
+
+    function midiFocusLetter() { return midi.focus ? 'B' : 'A'; }
+
+    // "F.play" -> "A.play" / "B.play" for the selected deck
+    function midiResolve(t) { return t.replace(/^F\./, midiFocusLetter() + '.'); }
+
+    function midiElement(target) {
+        var t = midiResolve(target);
+        if (/\.jog-touch$/.test(t) || /^lib\./.test(t)) return null;
+        return document.querySelector('[data-midi="' + t + '"]');
+    }
+
+    // ---- mapping keys with conditions ----
+    function midiKeyParts(k) {
+        var m = /^([^@\/]+)(?:@([^\/]+))?(?:\/([AB]))?$/.exec(k) || [k, k];
+        return { base: m[1], mode: m[2] || '', deck: m[3] || '' };
+    }
+
+    function midiKeyJoin(base, mode, deck) { return base + (mode ? '@' + mode : '') + (deck ? '/' + deck : ''); }
+
+    function midiLookup(base) {
+        var F = midiFocusLetter(), mo = midi.mode, m = midi.map;
+        return (mo && (m[midiKeyJoin(base, mo, F)] || m[midiKeyJoin(base, mo)])) || m[midiKeyJoin(base, '', F)] || m[base] || null;
+    }
+
+    function midiCondLabel(key) {
+        var p = midiKeyParts(key);
+        return (p.mode ? '  [' + p.mode + ']' : '') + (p.deck ? '  [deck ' + p.deck + ' selected]' : '');
+    }
+
+    function midiUsesFocus() {
+        return Object.keys(midi.map).some(function (k) { return /^F\.|^focus-|^lib\.load-f$/.test(midi.map[k].target) || !!midiKeyParts(k).deck; });
+    }
+
+    // ---- storage ----
+    function midiSave() {
+        try {
+            localStorage.setItem(MIDI_STORE, JSON.stringify({
+                map: midi.map, jogScale: midi.jogScale, jogStepsPerRev: midi.jogStepsPerRev, leds: midi.leds,
+                active: midi.active, modes: midi.modes, startMode: midi.startMode, mode: midi.mode, focus: midi.focus
+            }));
+        } catch (e) { /* ignore */ }
+        midiRenderPanel();
+        midiRenderProfiles();
+        midiRenderModes();
+        midiMarkMapped();
+    }
+
+    function midiLoad() {
+        try {
+            var s = JSON.parse(localStorage.getItem(MIDI_STORE) || '{}') || {};
+            midi.map = s.map || {};
+            midi.jogScale = s.jogScale || 1;
+            midi.jogStepsPerRev = s.jogStepsPerRev || 400;
+            midi.leds = Array.isArray(s.leds) ? s.leds : [];
+            midi.active = typeof s.active === 'string' ? s.active : '';
+            midi.modes = Array.isArray(s.modes) ? s.modes : [];
+            midi.startMode = s.startMode || '';
+            midi.mode = midi.modes.indexOf(s.mode) >= 0 ? s.mode : (midi.modes[0] || '');
+            midi.focus = s.focus === 1 ? 1 : 0;
+        } catch (e) { midi.map = {}; midi.leds = []; midi.modes = []; }
+    }
+
+    function midiMarkMapped() {
+        var mapped = {};
+        Object.keys(midi.map).forEach(function (k) {
+            var t = midi.map[k].target;
+            if (/^F\./.test(t)) { mapped['A' + t.slice(1)] = true; mapped['B' + t.slice(1)] = true; }
+            else mapped[t] = true;
+        });
+        document.querySelectorAll('[data-midi]').forEach(function (el) { toggle(el, 'midi-mapped', !!mapped[el.dataset.midi]); });
+        midiFocusUi();
+    }
+
+    // the selected deck is outlined when the mapping has a deck switch
+    function midiFocusUi() {
+        var on = midiUsesFocus();
+        toggle($('#deckA .deck'), 'midi-focus', on && midi.focus === 0);
+        toggle($('#deckB .deck'), 'midi-focus', on && midi.focus === 1);
+    }
+
+    // deck switch / mode changed on the controller
+    function midiStateChanged() {
+        midi.held = {};
+        midiFocusUi();
+        midiRenderModes();
+        try {
+            var s = JSON.parse(localStorage.getItem(MIDI_STORE) || '{}') || {};
+            s.mode = midi.mode;
+            s.focus = midi.focus;
+            localStorage.setItem(MIDI_STORE, JSON.stringify(s));
+        } catch (e) { /* ignore */ }
+    }
+
+    // ---- parsing ----
+    function midiParse(data) {
+        var status = data[0] & 0xF0, ch = data[0] & 0x0F;
+        if (status === 0x90 || status === 0x80) {
+            return { key: 'note:' + ch + ':' + data[1], kind: 'note', raw: data[2], on: status === 0x90 && data[2] > 0, value: data[2] / 127 };
+        }
+        if (status === 0xB0) return { key: 'cc:' + ch + ':' + data[1], kind: 'cc', raw: data[2], on: data[2] >= 64, value: data[2] / 127 };
+        if (status === 0xE0) {
+            var v = (data[2] << 7) | data[1];
+            return { key: 'pb:' + ch, kind: 'pb', raw: v, on: v >= 8192, value: v / 16383 };
+        }
+        return null;
+    }
+
+    function midiDescribe(key) {
+        var p = midiKeyParts(key).base.split(':');
+        if (p[0] === 'note') return 'Note ' + p[2] + ' (ch ' + (+p[1] + 1) + ')';
+        if (p[0] === 'cc') return 'CC ' + p[2] + ' (ch ' + (+p[1] + 1) + ')';
+        return 'Pitch bend (ch ' + (+p[1] + 1) + ')';
+    }
+
+    // relative jog value -> signed steps. Controllers use one of two codings:
+    //   around 64 (65 = +1, 63 = -1)  or  two's complement (1 = +1, 127 = -1).
+    // Single steps tell them apart: values near 64 mean the first, values near 0 / 127 the second.
+    // This is decided per message, so a wrong guess while learning cannot make the jog jump.
+    function midiJogSteps(msg) {
+        var v = msg.raw;
+        if (v >= 32 && v <= 96) return v - 64;
+        return v < 64 ? v : v - 128;
+    }
+
+    // ---- incoming messages ----
+    function midiOnMessage(e) {
+        var msg = midiParse(e.data);
+        if (!msg) return;
+        var src = e.target && e.target.name;
+        if (src && src !== midi.lastInput) {
+            // LEDs go back to the controller that is used
+            midi.lastInput = src;
+            var out = midiPickOut();
+            if (out !== midi.out) { midi.out = out; midi.ledCache = {}; }
+        }
+        var m = msg.kind === 'note' && !msg.on && midi.held[msg.key] ? midi.held[msg.key] : midiLookup(msg.key);
+        if (msg.kind === 'note') { if (msg.on) { if (m) midi.held[msg.key] = m; } else delete midi.held[msg.key]; }
+
+        midi.last = midiDescribe(msg.key) + ' = ' + msg.raw;
+        if (m && /\.jog$/.test(m.target)) midi.last += '  (step ' + midiJogSteps(msg) + ')';
+        if (m) midi.last += '  → ' + midiLabel(m.target);
+        var mon = $('#midiMonitor');
+        if (mon) mon.textContent = midi.last;
+
+        if (midi.learn && midi.pending) { midiLearnAssign(msg); return; }
+        if (m && midi.calib && /\.jog$/.test(m.target)) {
+            midi.calib.sum += midiJogSteps(msg);
+            $('#midiHint').textContent = 'Calibrating: turn the jog wheel exactly once around, then click Done.  Steps counted: ' + Math.abs(midi.calib.sum);
+            return;
+        }
+        if (m) midiDispatch(m, msg);
+    }
+
+    function midiLearnAssign(msg) {
+        // releases (note off / value 0) are ignored while learning, the press is what counts
+        if (msg.kind === 'note' && !msg.on) return;
+        var target = midi.pending, old = midi.relearn && midi.map[midi.relearn];
+        if ((midiRelTarget(target) || (old && old.rel)) && msg.kind !== 'cc') return;   // encoders send control changes
+        var mode = '', deck = '', entry;
+        if (old) {
+            // another control for an existing row: keep its function and conditions
+            var p = midiKeyParts(midi.relearn);
+            mode = p.mode;
+            deck = p.deck;
+            entry = midiClone(old);
+            delete midi.map[midi.relearn];
+        } else {
+            if ($('#midiLearnFocus').checked) target = target.replace(/^[AB]\./, 'F.');
+            if ($('#midiLearnMode').checked && midi.mode) mode = midi.mode;
+            entry = { target: target, invert: false };
+            Object.keys(midi.map).forEach(function (k) {
+                var kp = midiKeyParts(k);
+                if (midi.map[k].target === target && kp.mode === mode && !kp.deck) delete midi.map[k];
+            });
+        }
+        var key = midiKeyJoin(msg.key, mode, deck);
+        midi.map[key] = entry;
+        midi.relearn = null;
+        midiSetPending(null);
+        midiSave();
+        toast('MIDI: ' + midiLabel(entry.target) + midiCondLabel(key) + ' ← ' + midiDescribe(key));
+    }
+
+    function midiDeck(target) { return midiResolve(target).charAt(0) === 'A' ? decks[0] : decks[1]; }
+
+    function midiDispatch(m, msg) {
+        var t = midiResolve(m.target), val = m.invert ? 1 - msg.value : msg.value, press = msg.on;
+        var steps = msg.kind === 'cc' ? midiJogSteps(msg) * (m.invert ? -1 : 1) : 0;
+
+        // controller state: deck switch and modes
+        if (/^focus-/.test(t)) {
+            if (press) { midi.focus = t === 'focus-a' ? 0 : t === 'focus-b' ? 1 : 1 - midi.focus; midiStateChanged(); }
+            return;
+        }
+        if (t === 'mode-next') {
+            if (press && midi.modes.length) { midi.mode = midi.modes[(midi.modes.indexOf(midi.mode) + 1) % midi.modes.length]; midiStateChanged(); }
+            return;
+        }
+        if (/^mode:/.test(t)) {
+            if (press && midi.modes.indexOf(t.slice(5)) >= 0) { midi.mode = t.slice(5); midiStateChanged(); }
+            return;
+        }
+
+        // track list
+        if (t === 'lib.browse') {
+            var s = msg.kind === 'cc' ? steps : (press ? 1 : 0);
+            if (s) libSelectMove(s);
+            return;
+        }
+        if (/^lib\.load-[abf]$/.test(t)) {
+            if (press) libLoadSelected(t === 'lib.load-a' ? decks[0] : t === 'lib.load-b' ? decks[1] : decks[midi.focus]);
+            return;
+        }
+
+        // sampler pads: volume by encoder, play by button
+        var pv = /^pad-vol-(\d+)$/.exec(t);
+        if (pv) {
+            var vp = +pv[1] - 1, pad = smp.banks[smp.bank][vp];
+            if (!pad || !steps) return;
+            pad.vol = clamp(pad.vol + steps * 0.03, 0, 1.2);
+            var voice = smp.voices[voiceKey(smp.bank, vp)];
+            if (voice) smooth(voice.gain.gain, pad.vol);
+            saveSampler();
+            return;
+        }
+        var pp = /^pad-(\d+)$/.exec(t);
+        if (pp) {
+            var pi = +pp[1] - 1;
+            if (!smp.banks[smp.bank][pi]) return;   // empty pad: no file dialog from the controller
+            if (press) padDown(pi); else padUp(pi);
+            return;
+        }
+
+        // deck functions without a control on screen
+        var d = /^[AB]\./.test(t) ? midiDeck(t) : null, fn = d ? t.slice(2) : '';
+        if (fn === 'jog') { if (steps) d.midiJog(steps); return; }
+        if (fn === 'jog-touch') { d.midiTouch(m.invert ? !press : press); return; }
+        if (fn === 'beatjump') { if (steps && d.buffer) d.seek(clamp(d.position() + steps * (d.beatLen() || 0.5), 0, d.duration)); return; }
+        if (fn === 'tempo-fine') { if (steps) d.setTempo(clamp(d.tempo + steps * 0.001 / d.range, -1, 1)); return; }
+        if (fn === 'loop-size') { if (steps) d.resizeLoop(steps > 0 ? 2 : 0.5); return; }
+        var hs = /^hotcue-set-(\d+)$/.exec(fn);
+        if (hs) { if (press && d.buffer) { d.meta.hotcues[+hs[1] - 1] = d.position(); d.scheduleSave(); } return; }
+        if (fn === 'fx-prev' || fn === 'fx-next') {
+            if (!press) return;
+            var types = Object.keys(FX_TYPES), ti = types.indexOf(d.fx.type);
+            d.setFxType(types[(ti + (fn === 'fx-prev' ? -1 : 1) + types.length) % types.length]);
+            return;
+        }
+        if (fn === 'cue') { if (press) { manual(); d.cueDown(); } else d.cueUp(); return; }
+        if (fn === 'bend-down') { d.setNudge(press ? 0.96 : 1); return; }
+        if (fn === 'bend-up') { d.setNudge(press ? 1.04 : 1); return; }
+
+        var el = midiElement(t);
+        if (!el) return;
+
+        // continuous controls: absolute value, or relative steps of an encoder
+        if (el.tagName === 'INPUT' && el.type === 'range') {
+            var min = +el.min, max = +el.max;
+            var v = m.rel ? clamp(+el.value + steps * 0.02 * (max - min), min, max) : min + val * (max - min);
+            if (!m.rel && fn === 'tempo' && Math.abs(val - 0.5) < 0.01) v = 0;   // snap the centre detent
+            el.value = v;
+            el.dispatchEvent(new Event('input'));
+            return;
+        }
+        if (el._knob) { el._knob.set(m.rel ? clamp(el._knob.get() + steps * 0.02, 0, 1) : val); return; }
+
+        // buttons
+        if (press) el.click();
+    }
+
+    // ---- jog wheel ----
+    // one hardware turn = one turn of the platter (SEC_PER_REV), via the calibrated steps per turn,
+    // fine-tuned by the jog sensitivity of the MIDI panel
+    Deck.prototype.midiJog = function (steps) {
+        if (!this.buffer) return;
+        var self = this, secs = steps * SEC_PER_REV / midi.jogStepsPerRev * midi.jogScale;
+        clearTimeout(this.midiJogTimer);
+        if (this.midiTouching || !this.playing || this.scratching) {
+            if (!this.scratching) this.scratchBegin();
+            this.scratchMove(secs);
+            if (!this.midiTouching) this.midiJogTimer = setTimeout(function () { self.scratchEnd(); }, 120);
+        } else {
+            this.setNudge(clamp(1 + steps * 1.6 / midi.jogStepsPerRev * midi.jogScale, 0.85, 1.15));
+            this.midiJogTimer = setTimeout(function () { self.setNudge(1); }, 80);
+        }
+    };
+
+    Deck.prototype.midiTouch = function (on) {
+        this.midiTouching = on;
+        if (on && this.buffer && this.vinyl) { clearTimeout(this.midiJogTimer); if (!this.scratching) this.scratchBegin(); }
+        if (!on && this.scratching) this.scratchEnd();
+    };
+
+    // ---- learn mode ----
+    function midiSetPending(target) {
+        midi.pending = target;
+        if (!target) midi.relearn = null;
+        document.querySelectorAll('.midi-pending').forEach(function (el) { el.classList.remove('midi-pending'); });
+        var el = target && midiElement(target);
+        if (el) el.classList.add('midi-pending');
+        var hint = $('#midiHint');
+        if (hint) {
+            hint.textContent = !midi.learn ? 'Learn mode is off.'
+                : target ? 'Now move or press the control on your MIDI device for: ' + midiLabel(target) +
+                    (midi.relearn ? midiCondLabel(midi.relearn) : '')
+                    : 'Click a control in EmbyDJ (outlined), then move or press the control on your MIDI device.';
+        }
+    }
+
+    function midiSetLearn(on) {
+        midi.learn = on;
+        toggle(document.body, 'midi-learn', on);
+        toggle($('#midiLearnBtn'), 'on', on);
+        midiSetPending(null);
+    }
+
+    // while learning, clicks on EmbyDJ controls select the target instead of triggering it
+    function midiCapture(e) {
+        if (!midi.learn) return;
+        if (e.target.closest('#midiPanel')) return;
+        var el = e.target.closest('[data-midi]');
+        if (!el) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.type === 'pointerdown') midiSetPending(el.dataset.midi);
+    }
+
+    // ---- panel ----
+    function midiRenderPanel() {
+        var list = $('#midiList');
+        if (!list) return;
+        var keys = Object.keys(midi.map).sort(function (a, b) {
+            return midiLabel(midi.map[a].target).localeCompare(midiLabel(midi.map[b].target)) || a.localeCompare(b);
+        });
+        list.innerHTML = '';
+        if (!keys.length) { list.innerHTML = '<div class="midi-empty">No mappings yet.</div>'; return; }
+        keys.forEach(function (k) {
+            var m = midi.map[k], row = document.createElement('div');
+            row.className = 'midi-row';
+            row.innerHTML = '<span class="midi-target"></span><span class="midi-msg"></span>' +
+                '<label class="midi-inv" title="Invert direction"><input type="checkbox"> inv</label>' +
+                '<button class="btn tiny midi-edit" title="Assign another control on the device to this function">&#9998;</button>' +
+                '<button class="btn tiny midi-del" title="Remove">&#10005;</button>';
+            row.querySelector('.midi-target').textContent = midiLabel(m.target) + midiCondLabel(k);
+            row.querySelector('.midi-msg').textContent = midiDescribe(k);
+            var inv = row.querySelector('input');
+            inv.checked = !!m.invert;
+            inv.addEventListener('change', function () { m.invert = inv.checked; midiSave(); });
+            row.querySelector('.midi-edit').addEventListener('click', function () {
+                midiSetLearn(true);
+                midi.relearn = k;
+                midiSetPending(m.target);
+            });
+            row.querySelector('.midi-del').addEventListener('click', function () { delete midi.map[k]; midiSave(); });
+            list.appendChild(row);
+        });
+    }
+
+    // mode line and the "More functions" list (which also offers the modes)
+    function midiRenderModes() {
+        var sel = $('#midiModeSel');
+        if (!sel) return;
+        sel.innerHTML = '';
+        if (!midi.modes.length) {
+            var none = document.createElement('option');
+            none.textContent = '(no modes)';
+            none.value = '';
+            sel.appendChild(none);
+        }
+        midi.modes.forEach(function (m) {
+            var o = document.createElement('option');
+            o.value = o.textContent = m;
+            sel.appendChild(o);
+        });
+        sel.value = midi.mode;
+        sel.disabled = !midi.modes.length;
+        $('#midiLearnMode').disabled = !midi.modes.length;
+        $('#midiLearnModeName').textContent = midi.mode ? '"' + midi.mode + '"' : 'current mode';
+
+        var more = $('#midiMore');
+        more.innerHTML = '<option value="">More functions…</option>';
+        MIDI_EXTRA_TARGETS.concat(midi.modes.map(function (m) { return ['mode:' + m, 'Mode · ' + m]; })).forEach(function (x) {
+            var o = document.createElement('option');
+            o.value = x[0];
+            o.textContent = x[1];
+            more.appendChild(o);
+        });
+    }
+
+    function midiRenderDevices() {
+        var el = $('#midiDevices');
+        if (!el) return;
+        if (!midi.access) { el.textContent = 'Not connected.'; return; }
+        var names = [];
+        midi.access.inputs.forEach(function (input) { names.push(input.name + (input.state === 'connected' ? '' : ' (disconnected)')); });
+        el.textContent = names.length ? names.join(', ') : 'No MIDI device found - connect it and wait a moment.';
+        toggle($('#midiBtn'), 'on', names.length > 0);
+    }
+
+    function midiConnect() {
+        if (!navigator.requestMIDIAccess) { toast('MIDI needs Chrome or Edge, opened over https or localhost.'); return Promise.resolve(); }
+        if (midi.access) return Promise.resolve();
+        return navigator.requestMIDIAccess({ sysex: false }).then(function (access) {
+            midi.access = access;
+            function attach() {
+                access.inputs.forEach(function (input) { input.onmidimessage = midiOnMessage; });
+                midi.out = midiPickOut();
+                midi.ledCache = {};
+                midiRenderDevices();
+            }
+            access.onstatechange = attach;
+            attach();
+            try { localStorage.setItem(MIDI_STORE + '-on', '1'); } catch (e) { /* ignore */ }
+        }).catch(function (e) { toast('MIDI access denied: ' + (e.message || e)); });
+    }
+
+    function bindMidi() {
+        midiLoad();
+        tagMidiTargets();
+        document.addEventListener('pointerdown', midiCapture, true);
+        document.addEventListener('click', midiCapture, true);
+        document.addEventListener('dblclick', midiCapture, true);
+
+        var panel = $('#midiPanel');
+        $('#midiBtn').addEventListener('click', function () {
+            panel.classList.toggle('hidden');
+            if (!panel.classList.contains('hidden')) midiConnect().then(function () { midiRenderDevices(); midiRenderPanel(); });
+            else midiSetLearn(false);
+        });
+        $('#midiClose').addEventListener('click', function () { panel.classList.add('hidden'); midiSetLearn(false); });
+        $('#midiLearnBtn').addEventListener('click', function () { midiSetLearn(!midi.learn); });
+        $('#midiTouchA').addEventListener('click', function () { midiSetLearn(true); midiSetPending('A.jog-touch'); });
+        $('#midiTouchB').addEventListener('click', function () { midiSetLearn(true); midiSetPending('B.jog-touch'); });
+        $('#midiLibBrowse').addEventListener('click', function () { midiSetLearn(true); midiSetPending('lib.browse'); });
+        $('#midiLibLoadA').addEventListener('click', function () { midiSetLearn(true); midiSetPending('lib.load-a'); });
+        $('#midiLibLoadB').addEventListener('click', function () { midiSetLearn(true); midiSetPending('lib.load-b'); });
+        $('#midiMore').addEventListener('change', function () {
+            var v = this.value;
+            this.value = '';
+            if (v) { midiSetLearn(true); midiSetPending(v); }
+        });
+        $('#midiProfile').addEventListener('change', function () {
+            var v = $('#midiProfile').value;
+            if (/^saved:/.test(v)) { midiUseSaved(v.slice(6)); return; }
+            midi.active = '';
+            midiSave();
+        });
+        $('#midiModeSel').addEventListener('change', function () { midi.mode = this.value; midiStateChanged(); });
+        $('#midiModesEdit').addEventListener('click', function () {
+            var s = window.prompt('Modes of the controller, separated by commas (empty = none).\nControls can then do different things per mode.', midi.modes.join(', '));
+            if (s == null) return;
+            var list = [];
+            s.split(',').forEach(function (x) { x = x.trim().replace(/[^\w-]/g, '').slice(0, 20); if (x && list.indexOf(x) < 0) list.push(x); });
+            midi.modes = list;
+            if (list.indexOf(midi.mode) < 0) midi.mode = list[0] || '';
+            if (list.indexOf(midi.startMode) < 0) midi.startMode = '';
+            midiSave();
+        });
+        $('#midiSaveProfile').addEventListener('click', midiSaveProfile);
+        $('#midiDeleteProfile').addEventListener('click', midiDeleteProfile);
+        $('#midiExport').addEventListener('click', midiExportProfile);
+        midiLoadProfiles();
+        $('#midiImport').addEventListener('click', function () { $('#midiImportFile').click(); });
+        $('#midiImportFile').addEventListener('change', function () {
+            var files = Array.prototype.slice.call(this.files || []);
+            this.value = '';
+            if (files.length) midiImportFiles(files).then(midiApplyImport, function (e) { toast('Import failed: ' + (e.message || e)); });
+        });
+        $('#midiCalib').addEventListener('click', function () {
+            var btn = $('#midiCalib');
+            if (!midi.calib) {
+                var hasJog = Object.keys(midi.map).some(function (k) { return /\.jog$/.test(midi.map[k].target); });
+                if (!hasJog) { toast('Map a jog wheel first (LEARN, click a jog wheel, turn it).'); return; }
+                midiSetLearn(false);
+                midi.calib = { sum: 0 };
+                btn.textContent = 'Done';
+                btn.classList.add('on');
+                $('#midiHint').textContent = 'Calibrating: turn the jog wheel exactly once around, then click Done.  Steps counted: 0';
+                return;
+            }
+            var steps = Math.abs(midi.calib.sum);
+            midi.calib = null;
+            btn.textContent = 'Calibrate jog';
+            btn.classList.remove('on');
+            if (steps < 16) { toast('Too few steps counted - try again and turn once around.'); midiSetPending(null); return; }
+            midi.jogStepsPerRev = steps;
+            midi.jogScale = 1;
+            $('#midiJogScale').value = 1;
+            $('#midiJogScaleValue').textContent = '×1.00';
+            midiSave();
+            midiSetPending(null);
+            toast('Jog calibrated: ' + steps + ' steps per turn.');
+        });
+        $('#midiClear').addEventListener('click', function () {
+            if (!window.confirm('Remove all MIDI mappings?')) return;
+            midiLedsOff();
+            midi.map = {};
+            midi.leds = [];
+            midi.modes = [];
+            midi.mode = '';
+            midi.startMode = '';
+            midi.focus = 0;
+            midi.active = '';
+            midiSave();
+        });
+        var sens = $('#midiJogScale');
+        function showSens() {
+            $('#midiJogScaleValue').textContent = '×' + midi.jogScale.toFixed(2);
+            $('#midiJogScale').title = 'Calibrated: ' + midi.jogStepsPerRev + ' steps per turn';
+        }
+        sens.value = midi.jogScale;
+        showSens();
+        sens.addEventListener('input', function () { midi.jogScale = +sens.value; showSens(); midiSave(); });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && midi.learn) midiSetLearn(false); });
+
+        midiSave();
+        midi.ledTimer = setInterval(midiLeds, 100);
+
+        // reconnect automatically if MIDI was used before (the browser remembers the permission)
+        var used = false;
+        try { used = localStorage.getItem(MIDI_STORE + '-on') === '1'; } catch (e) { /* ignore */ }
+        if (used) midiConnect();
+    }
+
+    // =====================================================================================
+    // Library selection (for MIDI browsing): a highlighted row that can be moved and loaded
+    // =====================================================================================
+    var libSel = -1;
+
+    function libRows() { return Array.prototype.slice.call(document.querySelectorAll('#libBody tr')); }
+
+    function libSelect(i, scroll) {
+        var rows = libRows();
+        if (!rows.length) return;
+        i = clamp(i, 0, rows.length - 1);
+        rows.forEach(function (r) { if (r.classList.contains('selected')) r.classList.remove('selected'); });
+        rows[i].classList.add('selected');
+        libSel = i;
+        if (scroll !== false) rows[i].scrollIntoView({ block: 'nearest' });
+        if (i >= rows.length - 5 && (lib.start < lib.total || lib.genrePhase)) libMore();   // keep loading while browsing
+    }
+
+    function libSelectMove(steps) { libSelect((libSel < 0 ? (steps > 0 ? -1 : 0) : libSel) + steps); }
+
+    function libLoadSelected(deck) {
+        var tr = libRows()[libSel];
+        if (!tr) { toast('Select a track in the list first.'); return; }
+        manual();
+        deck.load(libItemsById[tr.dataset.id]);
+    }
+
+    function bindLibSelection() {
+        $('#libBody').addEventListener('click', function (e) {
+            if (e.target.closest('button')) return;
+            var tr = e.target.closest('tr');
+            if (tr) libSelect(libRows().indexOf(tr), false);
+        });
+    }
+
+    // =====================================================================================
+    // Import of mappings from other DJ software:
+    //   Mixxx           *.midi.xml                      (MIDI codes and functions in one file)
+    //   Virtual DJ      device definition + mapper .xml (definition = MIDI codes, mapper = functions)
+    // The plain assignments become learned mappings (and LEDs where the file describes them).
+    // Scripts are never run: script functions and control names are only matched by their name.
+    // =====================================================================================
+    function midiNum(s) {
+        if (s == null) return NaN;
+        s = String(s).replace(/["“”\s]/g, '');
+        if (!s) return NaN;
+        return /^0x/i.test(s) ? parseInt(s, 16) : parseInt(s, 10);
+    }
+
+    // status byte + number -> mapping key ("note:0:7", "cc:0:33", "pb:1")
+    function midiKeyOf(status, no) {
+        var t = status & 0xF0, ch = status & 0x0F;
+        if (t === 0x80 || t === 0x90) return isNaN(no) ? null : 'note:' + ch + ':' + no;
+        if (t === 0xB0) return isNaN(no) ? null : 'cc:' + ch + ':' + no;
+        if (t === 0xE0) return 'pb:' + ch;
+        return null;
+    }
+
+    function midiDeckLetter(n) { n = +n; return n >= 1 && n <= 4 ? (n % 2 ? 'A' : 'B') : null; }
+
+    // targets that need relative values (encoders) - all others take absolute values or buttons
+    function midiRelTarget(t) { return /\.(jog|beatjump|tempo-fine|loop-size)$/.test(t) || t === 'lib.browse' || /^pad-vol-\d+$/.test(t); }
+
+    // a target from a free name (Mixxx script function, Virtual DJ control name), or null
+    function midiGuessTarget(name, D, ctx) {
+        var n = String(name).toLowerCase()
+            .replace(/^[a-z0-9_]+\./, '')                 // script prefix "MyController."
+            .replace(/deck\s*\[\d\]\./, '').replace(/\.input$/, '').replace(/[\s_\-]+/g, '');
+        if (/shift|long|delete|clear|toggle|layer|lsb|mode|pfl|headphone|keylock|quantize|range|mic|led|fromcue|preview/.test(n)) return null;
+        if (ctx === 'library') {
+            if (/press|button|push/.test(n)) return null;
+            if (/scroll|selecttrack|selectknob|browse|movevertical|knob/.test(n)) return 'lib.browse';
+            return null;
+        }
+        if (ctx === 'sampler') return /pad|play|press/.test(n) ? 'pad' : null;
+        if (/(wheel|jog|platter)/.test(n) && /touch/.test(n)) return D && D + '.jog-touch';
+        if (/(wheel|jog|platter)/.test(n)) return /search|bend|wind/.test(n) ? null : D && D + '.jog';
+        if (/scroll|browse|selecttrack/.test(n)) return 'lib.browse';
+        if (/load/.test(n)) return D && (D === 'A' ? 'lib.load-a' : 'lib.load-b');
+        if (!D) {
+            if (/crossfader|xfader/.test(n)) return 'crossfader';
+            if (/master/.test(n) && /vol|gain|level/.test(n)) return 'master';
+            return null;
+        }
+        var hc = /hotcue(\d)/.exec(n);
+        if (/hotcue/.test(n) && !hc) return null;
+        if (hc) return +hc[1] >= 1 && +hc[1] <= HOTCUE_COUNT ? D + '.hotcue-' + hc[1] : null;
+        if (/loopin/.test(n)) return D + '.loop-in';
+        if (/loopout/.test(n)) return D + '.loop-out';
+        if (/loophalf|loophalve/.test(n)) return D + '.loop-half';
+        if (/loopdouble/.test(n)) return D + '.loop-double';
+        if (/loop/.test(n)) return /length|move|size|call/.test(n) ? null : D + '.loop';
+        if (/playpause|^play|playbutton|handleplay/.test(n)) return D + '.play';
+        if (/cue/.test(n)) return D + '.cue';
+        if (/sync/.test(n)) return D + '.sync';
+        if (/pitchbend|wind|nudge/.test(n)) return null;
+        if (/^(pitch|rate|tempo)(slider|fader)?(msb)?$/.test(n)) return D + '.tempo';
+        if (/^(volume|level|fader)/.test(n)) return D + '.volume';
+        if (/gain|trim/.test(n)) return D + '.gain';
+        if (/treble|high|hi$/.test(n)) return /kill/.test(n) ? D + '.kill-high' : D + '.eq-high';
+        if (/mid/.test(n)) return /kill/.test(n) ? D + '.kill-mid' : D + '.eq-mid';
+        if (/bass|low/.test(n)) return /kill/.test(n) ? D + '.kill-low' : D + '.eq-low';
+        if (/filter/.test(n)) return D + '.filter';
+        if (/vinyl|scratch/.test(n)) return D + '.vinyl';
+        if (/slip/.test(n)) return D + '.slip';
+        if (/brake/.test(n)) return D + '.brake';
+        if (/backspin|spinback/.test(n)) return D + '.backspin';
+        if (/(fx|effect)/.test(n) && /(on|enable|active|press)$/.test(n)) return D + '.fx-on';
+        return null;
+    }
+
+    // ---- Mixxx ----
+    function mixxxTarget(group, key) {
+        var m, D = null;
+        if ((m = /^\[Channel([1-4])\]$/.exec(group)) || (m = /^([1-4])$/.exec(group))) D = midiDeckLetter(m[1]);
+        if ((m = /^\[EqualizerRack1_\[Channel([1-4])\]_Effect1\]$/.exec(group))) {
+            D = midiDeckLetter(m[1]);
+            var eq = { parameter1: 'eq-low', parameter2: 'eq-mid', parameter3: 'eq-high',
+                button_parameter1: 'kill-low', button_parameter2: 'kill-mid', button_parameter3: 'kill-high' }[key];
+            return eq ? D + '.' + eq : null;
+        }
+        if ((m = /^\[QuickEffectRack1_\[Channel([1-4])\]\]$/.exec(group))) return key === 'super1' ? midiDeckLetter(m[1]) + '.filter' : null;
+        if (/^\[EffectRack1_EffectUnit\d\]$/.test(group)) {
+            m = /^group_\[Channel([1-4])\]_enable$/.exec(key);
+            return m ? midiDeckLetter(m[1]) + '.fx-on' : null;
+        }
+        if ((m = /^\[Sampler(\d+)\]$/.exec(group))) {
+            return +m[1] <= PADS && /^(cue_gotoandplay|start_play|play|cue_default|cue_play)$/.test(key) ? 'pad-' + m[1] : null;
+        }
+        if (group === '[Master]') {
+            if (key === 'crossfader') return 'crossfader';
+            if (key === 'gain' || key === 'volume') return 'master';
+            return null;
+        }
+        if (group === '[Library]' || group === '[Playlist]') {
+            return /^(MoveVertical|SelectTrackKnob)$/.test(key) ? 'lib.browse' : null;
+        }
+        if (group === '[AutoDJ]') return key === 'enabled' ? 'automix' : key === 'skip_next' ? 'automix-skip' : null;
+        if (!D) return null;
+        var plain = {
+            play: 'play', cue_default: 'cue', sync_enabled: 'sync', beatsync: 'sync', rate: 'tempo', jog: 'jog',
+            volume: 'volume', pregain: 'gain', filterHigh: 'eq-high', filterMid: 'eq-mid', filterLow: 'eq-low',
+            filterHighKill: 'kill-high', filterMidKill: 'kill-mid', filterLowKill: 'kill-low',
+            loop_halve: 'loop-half', loop_double: 'loop-double', loop_in: 'loop-in', loop_out: 'loop-out',
+            reloop_toggle: 'loop', reloop_exit: 'loop', beatloop_4_toggle: 'loop', beatloop_4_activate: 'loop',
+            beatloop_activate: 'loop', rate_temp_down: 'bend-down', rate_temp_up: 'bend-up', rate_set_zero: 'tempo-zero',
+            slip_enabled: 'slip', bpm_tap: 'tap', LoadSelectedTrack: D === 'A' ? '#lib.load-a' : '#lib.load-b'
+        }[key];
+        if (plain) return plain.charAt(0) === '#' ? plain.slice(1) : D + '.' + plain;
+        m = /^hotcue_(\d+)_activate$/.exec(key);
+        return m && +m[1] <= HOTCUE_COUNT ? D + '.hotcue-' + m[1] : null;
+    }
+
+    // deck state an LED shows; Mixxx output key -> EmbyDJ target
+    function mixxxLedTarget(group, key) {
+        var m = /^\[Channel([1-4])\]$/.exec(group);
+        if (m) {
+            var D = midiDeckLetter(m[1]);
+            if (key === 'play' || key === 'play_indicator') return D + '.play';
+            if (key === 'cue_indicator' || key === 'cue_default') return D + '.cue';
+            if (key === 'loop_enabled') return D + '.loop';
+            if (key === 'slip_enabled') return D + '.slip';
+            var h = /^hotcue_(\d+)_(enabled|status)$/.exec(key);
+            if (h && +h[1] <= HOTCUE_COUNT) return D + '.hotcue-' + h[1];
+            return null;
+        }
+        if (/^\[EffectRack1_EffectUnit\d\]$/.test(group) && (m = /^group_\[Channel([1-4])\]_enable$/.exec(key))) return midiDeckLetter(m[1]) + '.fx-on';
+        return null;
+    }
+
+    // deck of a script binding: from the group ([Channel1]) or the function name (deck[0].play)
+    function mixxxScriptDeck(group, key) {
+        var m = /^\[Channel([1-4])\]$/.exec(group) || /^([1-4])$/.exec(group);
+        if (m) return midiDeckLetter(m[1]);
+        m = /deck\s*\[([0-3])\]/i.exec(key);
+        return m ? midiDeckLetter(+m[1] + 1) : null;
+    }
+
+    function midiImportMixxx(doc, res) {
+        var info = doc.querySelector('info > name');
+        res.name = info ? info.textContent.trim() : 'Mixxx mapping';
+        var text = function (el, tag) { var c = el.getElementsByTagName(tag)[0]; return c ? c.textContent.trim() : ''; };
+        Array.prototype.forEach.call(doc.getElementsByTagName('control'), function (c) {
+            var group = text(c, 'group'), key = text(c, 'key');
+            var k = midiKeyOf(midiNum(text(c, 'status')), midiNum(text(c, 'midino')));
+            var opts = [], o = c.getElementsByTagName('options')[0];
+            if (o) Array.prototype.forEach.call(o.children, function (x) { opts.push(x.tagName.toLowerCase()); });
+            if (!k) return;
+            if (opts.indexOf('fourteen-bit-lsb') >= 0) return;   // the second half of a 14-bit value
+            var script = opts.indexOf('script-binding') >= 0;
+            var rel = opts.some(function (x) { return /rot64|diff|spread64|hercjog|selectknob/.test(x); });
+            var t = script
+                ? midiGuessTarget(key, mixxxScriptDeck(group, key),
+                    /^\[(Library|Playlist)\]$/.test(group) ? 'library' : /^\[Sampler\d+\]$/.test(group) ? 'sampler' : null)
+                : mixxxTarget(group, key);
+            if (t === 'pad') { var sn = +/^\[Sampler(\d+)\]$/.exec(group)[1]; t = sn <= PADS ? 'pad-' + sn : null; }
+            midiImportAdd(res, k, t, script ? group + ' ' + key : key, opts.indexOf('invert') >= 0, rel, script);
+        });
+        Array.prototype.forEach.call(doc.getElementsByTagName('output'), function (c) {
+            var t = mixxxLedTarget(text(c, 'group'), text(c, 'key'));
+            var status = midiNum(text(c, 'status')), no = midiNum(text(c, 'midino'));
+            if (!t || isNaN(status) || isNaN(no)) return;
+            var on = midiNum(text(c, 'on')), off = midiNum(text(c, 'off'));
+            midiImportLed(res, t, status, no, isNaN(on) ? 0x7F : on, isNaN(off) ? 0 : off);
+        });
+    }
+
+    // ---- Virtual DJ ----
+    // the unshifted, first command of a VDJscript action, plus an explicit deck ("deck 2 play_pause")
+    function vdjCommand(action) {
+        var a = String(action || '').toLowerCase().trim();
+        var q = a.indexOf('?');
+        if (q > 0) {
+            var cond = a.slice(0, q), rest = a.slice(q + 1), colon = rest.indexOf(':');
+            a = colon < 0 ? rest : /shift/.test(cond) ? rest.slice(colon + 1) : rest.slice(0, colon);
+        }
+        a = a.split('&')[0].trim();
+        var deck = null, m = /^deck\s+(\d|left|right)\s+(.*)$/.exec(a);
+        if (m) { deck = m[1] === 'left' ? 'A' : m[1] === 'right' ? 'B' : midiDeckLetter(m[1]); a = m[2]; }
+        var parts = a.split(/\s+/);
+        return { cmd: parts[0] || '', arg: parts[1] || '', deck: deck };
+    }
+
+    function vdjTarget(action, keyDeck) {
+        var c = vdjCommand(action), D = c.deck || keyDeck, cmd = c.cmd, n = parseInt(c.arg, 10);
+        var global = { crossfader: 'crossfader', master_volume: 'master', automix: 'automix', browser_scroll: 'lib.browse' }[cmd];
+        if (global) return global;
+        if (/^(sampler_pad|sampler_play)$/.test(cmd)) return n >= 1 && n <= PADS ? 'pad-' + n : null;
+        if (!D) return null;
+        if (cmd === 'load') return D === 'A' ? 'lib.load-a' : 'lib.load-b';
+        if (cmd === 'hot_cue' || cmd === 'hotcue') return n >= 1 && n <= HOTCUE_COUNT ? D + '.hotcue-' + n : null;
+        if (cmd === 'effect_slider') return n === 1 ? D + '.fx-param1' : n === 2 ? D + '.fx-param2' : null;
+        if (cmd === 'pitch_bend') return D + (/^-/.test(c.arg) ? '.bend-down' : '.bend-up');
+        var t = {
+            play_pause: 'play', play: 'play', play_stutter: 'play', cue_stop: 'cue', cue: 'cue', cue_play: 'cue',
+            sync: 'sync', play_sync: 'sync', pitch_slider: 'tempo', pitch: 'tempo', pitch_reset: 'tempo-zero',
+            jogwheel: 'jog', jog_wheel: 'jog', scratch_wheel: 'jog', touchwheel: 'jog', nudge_wheel: 'jog',
+            touchwheel_touch: 'jog-touch', scratch_wheel_touch: 'jog-touch', jogwheel_touch: 'jog-touch',
+            vinyl_mode: 'vinyl', slip_mode: 'slip', brake: 'brake', backspin: 'backspin',
+            volume_slider: 'volume', level: 'volume', volume: 'volume', gain_slider: 'gain', gain: 'gain',
+            eq_high: 'eq-high', eq_mid: 'eq-mid', eq_low: 'eq-low', eq_kill_high: 'kill-high', eq_kill_mid: 'kill-mid',
+            eq_kill_low: 'kill-low', filter: 'filter', filter_slider: 'filter',
+            loop: 'loop', auto_loop: 'loop', reloop: 'loop', loop_exit: 'loop', loop_half: 'loop-half',
+            loop_double: 'loop-double', loop_in: 'loop-in', loop_out: 'loop-out', effect_active: 'fx-on',
+            bpm_tap: 'tap', tap: 'tap'
+        }[cmd];
+        return t ? D + '.' + t : null;
+    }
+
+    // definition: control name -> [{ key, deck, kind }] and LEDs name -> [{ status, no, on, off, deck }]
+    function vdjParseDefinition(doc) {
+        var def = { name: '', controls: {}, leds: {} };
+        var root = doc.documentElement;
+        def.name = root.getAttribute('description') || root.getAttribute('name') || 'Virtual DJ controller';
+        Array.prototype.forEach.call(root.getElementsByTagName('*'), function (el) {
+            var tag = el.tagName.toLowerCase(), name = (el.getAttribute('name') || '').toUpperCase();
+            if (!name) return;
+            var ch = midiNum(el.getAttribute('channel')); if (isNaN(ch)) ch = 0;
+            var deck = midiDeckLetter(el.getAttribute('deck'));
+            var note = midiNum(el.getAttribute('note')), cc = midiNum(el.getAttribute('ccmsb'));
+            if (isNaN(cc)) cc = midiNum(el.getAttribute('cc'));
+            var status = !isNaN(note) ? 0x90 | ch : !isNaN(cc) ? 0xB0 | ch : el.getAttribute('pitch') === 'true' ? 0xE0 | ch : NaN;
+            var no = !isNaN(note) ? note : cc;
+            if (isNaN(status)) return;
+            if (tag === 'led') {
+                var on = midiNum(el.getAttribute('value')), off = midiNum(el.getAttribute('off'));
+                (def.leds[name] = def.leds[name] || []).push({ status: status, no: no, on: isNaN(on) ? 0x7F : on, off: isNaN(off) ? 0 : off, deck: deck });
+                return;
+            }
+            if (!/^(button|slider|encoder|jog|knob|pot)$/.test(tag)) return;
+            var key = midiKeyOf(status, no);
+            if (!key) return;
+            (def.controls[name] = def.controls[name] || []).push({ key: key, deck: deck, kind: tag, autoled: el.getAttribute('autoled') === 'true', status: status, no: no });
+        });
+        return def;
+    }
+
+    function midiImportVdj(defDoc, mapDoc, res) {
+        var def = vdjParseDefinition(defDoc);
+        res.name = def.name;
+        var actions = {};   // control name -> action
+        if (mapDoc) {
+            Array.prototype.forEach.call(mapDoc.getElementsByTagName('map'), function (m) {
+                var v = (m.getAttribute('value') || '').toUpperCase();
+                if (v) actions[v] = m.getAttribute('action') || '';
+            });
+        }
+        Object.keys(def.controls).forEach(function (name) {
+            def.controls[name].forEach(function (c) {
+                var rel = c.kind === 'encoder' || c.kind === 'jog';
+                var t = mapDoc ? (actions[name] != null ? vdjTarget(actions[name], c.deck) : null) : midiGuessTarget(name, c.deck, null);
+                midiImportAdd(res, c.key, t, name + (actions[name] ? ' = ' + actions[name] : ''), false, rel, !mapDoc);
+                if (t && c.autoled && /^[AB]\./.test(t)) midiImportLed(res, t, c.status, c.no, 0x7F, 0);
+            });
+        });
+        Object.keys(def.leds).forEach(function (name) {
+            def.leds[name].forEach(function (l) {
+                var t = actions[name] != null ? vdjTarget(actions[name], l.deck) : null;
+                if (t && /^[AB]\./.test(t)) midiImportLed(res, t, l.status, l.no, l.on, l.off);
+            });
+        });
+    }
+
+    // ---- shared ----
+    var MIDI_CONTINUOUS = /\.(tempo|volume|gain|eq-high|eq-mid|eq-low|filter|fx-param\d|fx-drywet)$|^(crossfader|master|sampler-volume)$/;
+
+    function midiImportAdd(res, key, target, what, invert, rel, guessed) {
+        if (target) {
+            if (midiRelTarget(target)) { if (!/^cc:/.test(key)) target = null; }           // jog / browse need an encoder
+            else if (rel) target = null;                                                  // an encoder on a fader or knob
+            else if (MIDI_CONTINUOUS.test(target) && !/^(cc|pb):/.test(key)) target = null; // a button on a fader or knob
+        }
+        if (!target) { if (res.skipped.indexOf(what) < 0) res.skipped.push(what); return; }
+        if (res.map[key]) return;                       // first assignment of a message wins
+        res.map[key] = { target: target, invert: !!invert };
+        if (guessed) res.guessed++;
+    }
+
+    function midiImportLed(res, target, status, no, on, off) {
+        if (res.leds.some(function (l) { return l.status === status && l.no === no; })) return;
+        res.leds.push({ target: target, status: status, no: no, on: on, off: off });
+    }
+
+    function midiImportFiles(files) {
+        var reads = Array.prototype.map.call(files, function (f) {
+            return f.text().then(function (s) {
+                if (/^\s*\{/.test(s)) { try { return { file: f.name, json: JSON.parse(s) }; } catch (e) { return { file: f.name }; } }
+                return { file: f.name, doc: new DOMParser().parseFromString(s, 'application/xml') };
+            });
+        });
+        return Promise.all(reads).then(function (docs) {
+            var res = { name: '', format: '', map: {}, leds: [], skipped: [], guessed: 0, error: '' };
+            var mixxx = null, def = null, mapper = null, emby = null;
+            docs.forEach(function (d) {
+                if (d.json) { if (d.json.embydj === 'midi-profile') emby = d.json; return; }
+                if (!d.doc || d.doc.getElementsByTagName('parsererror').length) return;
+                var root = d.doc.documentElement.tagName;
+                if (root === 'MixxxControllerPreset' || root === 'MixxxMIDIPreset') mixxx = d.doc;
+                else if (root === 'device') def = d.doc;
+                else if (root === 'mapper') mapper = d.doc;
+            });
+            if (emby) {
+                res.format = 'EmbyDJ';
+                res.name = String(emby.name || 'EmbyDJ profile').slice(0, 60);
+                Object.keys(emby.map || {}).forEach(function (k) {
+                    var m = emby.map[k];
+                    if (!/^(note:\d+:\d+|cc:\d+:\d+|pb:\d+)(@[\w-]+)?(\/[AB])?$/.test(k) || !m || typeof m.target !== 'string') return;
+                    res.map[k] = { target: m.target, invert: !!m.invert };
+                    if (m.rel) res.map[k].rel = true;
+                });
+                res.leds = (Array.isArray(emby.leds) ? emby.leds : []).filter(function (l) {
+                    return l && typeof l.target === 'string' && l.status >= 0x80 && l.status <= 0xFF && l.no >= 0 && l.no <= 127;
+                }).map(function (l) {
+                    var x = { target: l.target, status: l.status, no: l.no, on: l.on >= 0 ? l.on : 0x7F, off: l.off >= 0 ? l.off : 0 };
+                    if (l.mode) x.mode = String(l.mode);
+                    if (l.deck === 'A' || l.deck === 'B') x.deck = l.deck;
+                    return x;
+                });
+                res.modes = Array.isArray(emby.modes) ? emby.modes : [];
+                res.startMode = emby.startMode || '';
+                res.jogStepsPerRev = emby.jogStepsPerRev;
+                res.jogScale = emby.jogScale;
+            }
+            else if (mixxx) { res.format = 'Mixxx'; midiImportMixxx(mixxx, res); }
+            else if (def) { res.format = 'Virtual DJ'; midiImportVdj(def, mapper, res); }
+            else if (mapper) {
+                res.error = 'This Virtual DJ mapping only names the controls (PLAY, JOG ...), their MIDI codes are in the ' +
+                    'device definition. Select both files together (the definition is in Documents\\VirtualDJ\\Devices). ' +
+                    'For controllers built into Virtual DJ there is no definition file - use LEARN instead.';
+            } else {
+                res.error = 'Not a Mixxx (.midi.xml) or Virtual DJ (.xml) mapping.';
+            }
+            if (!res.error && !Object.keys(res.map).length) res.error = 'Nothing in this file could be translated - use LEARN instead.';
+            return res;
+        });
+    }
+
+    function midiApplyImport(res) {
+        if (res.error) { toast(res.error); $('#midiHint').textContent = res.error; return; }
+        var count = Object.keys(res.map).length;
+        if (Object.keys(midi.map).length && !window.confirm('Replace the current MIDI mappings with "' + res.name + '" (' + count + ' controls)?')) return;
+        midi.active = '';
+        midiApplyProfileData({
+            map: res.map, leds: res.leds, modes: res.modes, startMode: res.startMode,
+            jogStepsPerRev: res.jogStepsPerRev || midi.jogStepsPerRev, jogScale: res.jogScale || midi.jogScale
+        });
+        midiSave();
+        var msg = 'Imported "' + res.name + '" (' + res.format + '): ' + count + ' controls' +
+            (res.leds.length ? ', ' + res.leds.length + ' LEDs' : '') +
+            (res.modes && res.modes.length ? ', modes ' + res.modes.join(' / ') : '') +
+            (res.guessed ? ' (' + res.guessed + ' matched by name - check them)' : '') + '.';
+        if (res.skipped.length) {
+            msg += ' Not translated: ' + res.skipped.slice(0, 8).join(', ') + (res.skipped.length > 8 ? ' and ' + (res.skipped.length - 8) + ' more' : '') +
+                '. Map missing controls with LEARN.';
+        }
+        $('#midiHint').textContent = msg + ' Use "Save profile" to keep it.';
+        toast('Imported ' + count + ' MIDI controls from "' + res.name + '".');
+    }
+
+    // ---- LEDs ----
+    function midiLedOn(l) {
+        if (l.mode && l.mode !== midi.mode) return false;
+        if (l.deck && l.deck !== midiFocusLetter()) return false;
+        var t = midiResolve(l.target);
+        if (t === 'focus-a') return midi.focus === 0;
+        if (t === 'focus-b') return midi.focus === 1;
+        if (/^mode:/.test(t)) return midi.mode === t.slice(5);
+        var pm = /^pad-(\d+)$/.exec(t);
+        if (pm) return !!smp.voices[voiceKey(smp.bank, +pm[1] - 1)];
+        if (!/^[AB]\./.test(t)) return false;
+        var d = midiDeck(t), name = t.slice(2);
+        if (name === 'play') return d.playing;
+        if (name === 'cue') return !!d.buffer && !d.playing && Math.abs(d.pos - (d.meta.cue || 0)) < 0.02;
+        if (/^hotcue-\d+$/.test(name)) return d.meta.hotcues[+name.split('-')[1] - 1] != null;
+        if (name === 'loop') return d.loop.active;
+        if (name === 'fx-on') return d.fx.on;
+        if (name === 'vinyl') return !!d.vinyl;
+        if (name === 'slip') return !!d.slip;
+        return false;
+    }
+
+    // one LED can show different things per mode / selected deck: it is lit when any matching entry is on
+    function midiLeds() {
+        if (!midi.out || !midi.leds.length) return;
+        var want = {};
+        midi.leds.forEach(function (l) {
+            var k = l.status + ':' + l.no;
+            if (!want[k]) want[k] = { l: l, on: false };
+            if (!want[k].on && midiLedOn(l)) want[k] = { l: l, on: true };
+        });
+        Object.keys(want).forEach(function (k) {
+            var w = want[k];
+            if (midi.ledCache[k] === w.on) return;
+            midi.ledCache[k] = w.on;
+            try { midi.out.send([w.l.status, w.l.no, w.on ? w.l.on : w.l.off]); } catch (e) { /* device gone */ }
+        });
+    }
+
+    function midiLedsOff() {
+        if (midi.out) midi.leds.forEach(function (l) { try { midi.out.send([l.status, l.no, l.off]); } catch (e) { /* ignore */ } });
+        midi.ledCache = {};
+    }
+
+    // output for LEDs: the port of the controller that sent the last message,
+    // else the only real port (not the built-in Windows synthesizer)
+    function midiPickOut() {
+        if (!midi.access) return null;
+        var outs = [];
+        midi.access.outputs.forEach(function (o) { if (o.state === 'connected' && !/wavetable|microsoft gs/i.test(o.name)) outs.push(o); });
+        var base = function (s) { return String(s || '').toLowerCase().replace(/^\d+-\s*/, '').replace(/\s*\d+$/, '').replace(/midiin|midiout|\bin\b|\bout\b/g, '').trim(); };
+        return outs.filter(function (o) { return midi.lastInput && base(o.name) === base(midi.lastInput); })[0] ||
+            (outs.length === 1 ? outs[0] : null);
+    }
+
+    // =====================================================================================
+    // Saved controller profiles: a learned / imported mapping stored under a name on the server
+    // (per administrator, so it is available in every browser), plus export / import as a file.
+    // =====================================================================================
+    function midiClone(o) { return JSON.parse(JSON.stringify(o)); }
+
+    function midiProfileData() {
+        return {
+            map: midi.map, leds: midi.leds, modes: midi.modes, startMode: midi.startMode,
+            jogStepsPerRev: midi.jogStepsPerRev, jogScale: midi.jogScale
+        };
+    }
+
+    function midiStoreProfiles() {
+        return apiFetch('/EmbyDJ/Midi/Profiles', null, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ Data: JSON.stringify({ v: 1, profiles: midi.saved }) })
+        }).catch(function (e) { toast('Saving the MIDI profiles failed: ' + e.message); });
+    }
+
+    function midiLoadProfiles() {
+        return apiJson('/EmbyDJ/Midi/Profiles').then(function (data) {
+            midi.saved = data && data.profiles && typeof data.profiles === 'object' ? data.profiles : {};
+            midiRenderProfiles();
+        }).catch(function () { /* keep the empty list */ });
+    }
+
+    function midiRenderProfiles() {
+        var sel = $('#midiProfile');
+        if (!sel) return;
+        var names = Object.keys(midi.saved).sort(function (a, b) { return a.localeCompare(b); });
+        if (midi.active && !midi.saved[midi.active]) midi.active = '';
+        var modified = midi.active && JSON.stringify(midiProfileData()) !== JSON.stringify(midi.saved[midi.active]);
+        sel.innerHTML = '';
+        function add(parent, value, label) {
+            var o = document.createElement('option');
+            o.value = value;
+            o.textContent = label;
+            parent.appendChild(o);
+        }
+        add(sel, 'learn', 'Learned mapping (not saved)');
+        if (names.length) {
+            var group = document.createElement('optgroup');
+            group.label = 'Saved profiles';
+            names.forEach(function (n) { add(group, 'saved:' + n, n + (n === midi.active && modified ? '  (changed)' : '')); });
+            sel.appendChild(group);
+        }
+        sel.value = midi.active ? 'saved:' + midi.active : 'learn';
+        $('#midiDeleteProfile').disabled = !midi.active;
+        $('#midiSaveProfile').textContent = modified ? 'Save changes' : 'Save profile…';
+    }
+
+    function midiApplyProfileData(p) {
+        midiLedsOff();
+        midi.map = midiClone(p.map || {});
+        midi.leds = midiClone(Array.isArray(p.leds) ? p.leds : []);
+        if (p.jogStepsPerRev >= 16) midi.jogStepsPerRev = p.jogStepsPerRev;
+        midi.jogScale = p.jogScale > 0 ? p.jogScale : 1;
+        midi.modes = (Array.isArray(p.modes) ? p.modes : []).filter(function (m) { return typeof m === 'string' && /^[\w-]{1,20}$/.test(m); });
+        midi.startMode = midi.modes.indexOf(p.startMode) >= 0 ? p.startMode : '';
+        midi.mode = midi.startMode || midi.modes[0] || '';
+        midi.focus = 0;
+        midi.held = {};
+        var sens = $('#midiJogScale');
+        sens.value = midi.jogScale;
+        sens.dispatchEvent(new Event('input'));
+    }
+
+    function midiUseSaved(name) {
+        var p = midi.saved[name];
+        if (!p) return;
+        midiApplyProfileData(p);
+        midi.active = name;
+        midiSave();
+        toast('MIDI profile "' + name + '" loaded.');
+    }
+
+    function midiSaveProfile() {
+        if (!Object.keys(midi.map).length) { toast('Nothing to save - learn or import a mapping first.'); return; }
+        var name = midi.active;
+        var modified = name && JSON.stringify(midiProfileData()) !== JSON.stringify(midi.saved[name]);
+        if (!modified) {
+            name = window.prompt('Name of this controller profile:', name || midi.lastInput || '');
+            if (name == null) return;
+            name = name.trim().slice(0, 60);
+            if (!name) return;
+            if (midi.saved[name] && name !== midi.active && !window.confirm('Replace the saved profile "' + name + '"?')) return;
+        }
+        midi.saved[name] = midiClone(midiProfileData());
+        midi.active = name;
+        midiStoreProfiles();
+        midiSave();
+        toast('MIDI profile "' + name + '" saved.');
+    }
+
+    function midiDeleteProfile() {
+        var name = midi.active;
+        if (!name || !window.confirm('Delete the saved profile "' + name + '"? The current mapping stays as an unsaved learned mapping.')) return;
+        delete midi.saved[name];
+        midi.active = '';
+        midiStoreProfiles();
+        midiSave();
+        toast('MIDI profile "' + name + '" deleted.');
+    }
+
+    function midiExportProfile() {
+        if (!Object.keys(midi.map).length) { toast('Nothing to export - learn or import a mapping first.'); return; }
+        var name = midi.active || 'MIDI controller';
+        var data = Object.assign({ embydj: 'midi-profile', v: 1, name: name }, midiClone(midiProfileData()));
+        var url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = name.replace(/[\\/:*?"<>|]+/g, '_') + '.embydj-midi.json';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    }
+
+    // =====================================================================================
     // Keyboard
     // =====================================================================================
     var KEYMAP = {
@@ -3313,6 +4523,8 @@
         bindLibrary();
         bindColumns();
         bindAutoMix();
+        bindLibSelection();
+        bindMidi();
         toggle($('#autoGainBtn'), 'on', autoGain);
         $('#autoGainBtn').addEventListener('click', function () {
             autoGain = !autoGain;

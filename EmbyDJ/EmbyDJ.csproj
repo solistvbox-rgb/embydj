@@ -11,9 +11,9 @@
     <AssemblyName>EmbyDJ</AssemblyName>
     <RootNamespace>EmbyDJ</RootNamespace>
     <!-- Bump on every release, also for web-only changes: the web app is loaded with ?v=<version>. -->
-    <Version>0.2.0.4</Version>
-    <AssemblyVersion>0.2.0.4</AssemblyVersion>
-    <FileVersion>0.2.0.4</FileVersion>
+    <Version>0.3.0.0</Version>
+    <AssemblyVersion>0.3.0.0</AssemblyVersion>
+    <FileVersion>0.3.0.0</FileVersion>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <!--
       Only EmbyDJ.dll is needed by Emby. No debug file (.pdb): the compiler would embed its build

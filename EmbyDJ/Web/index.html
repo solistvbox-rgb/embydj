@@ -25,7 +25,6 @@
           <option value="32">32 beats</option>
         </select>
         <button class="btn small" id="amSkip" title="Mix to the next track now">SKIP</button>
-        <span class="am-next" id="amNext"></span>
       </div>
       <div class="master-box" title="Master">
         <span class="mb-label">MASTER</span>
@@ -35,6 +34,7 @@
         <div class="knob small" id="masterKnob" title="Master volume (double-click resets)"></div>
       </div>
       <button class="btn small hidden" id="newTabBtn" data-i18n="newTab">Open in new tab</button>
+      <button class="btn small" id="midiBtn" title="MIDI controller: connect and map controls (learn mode)">MIDI</button>
       <button class="btn small" id="helpBtn" title="Keyboard shortcuts">?</button>
     </header>
 
@@ -111,7 +111,7 @@
                 <div class="artist"></div>
               </div>
               <div class="bpmbox">
-                <div class="bpm-line"><span class="bpm">---</span><button class="btn tiny bpm-tap" title="Tap tempo">TAP</button></div>
+                <div class="bpm-line"><span class="bpm" title="Double-click: detect BPM and beat grid again (undoes /2, x2 and TAP)">---</span><button class="btn tiny bpm-tap" title="Tap tempo">TAP</button></div>
                 <div class="bpm-sub">
                   <span>BPM</span>
                   <button class="btn tiny bpm-half" title="BPM / 2">/2</button>
@@ -258,6 +258,54 @@
   </div>
 
   <div id="toast" class="toast"></div>
+
+  <div id="midiPanel" class="midi-panel hidden">
+    <div class="midi-head">
+      <b>MIDI controller</b>
+      <button class="btn tiny" id="midiClose" title="Close">&#10005;</button>
+    </div>
+    <div class="midi-line"><span class="midi-key">Device</span><span id="midiDevices">Not connected.</span></div>
+    <label class="midi-line"><span class="midi-key">Profile</span>
+      <select id="midiProfile">
+        <option value="learn">Learned mapping (not saved)</option>
+      </select>
+    </label>
+    <div class="midi-line"><span class="midi-key">Mode</span><select id="midiModeSel" title="Current mode of the controller (switch it on the device or here)"></select><button class="btn tiny" id="midiModesEdit" title="Define the modes of the controller (e.g. sampler, loop, fx, cue)">Modes…</button></div>
+    <div class="midi-line"><span class="midi-key">Last message</span><span id="midiMonitor">-</span></div>
+    <div class="midi-actions">
+      <button class="btn small" id="midiLearnBtn" title="Click a control in EmbyDJ, then move or press the control on the device (Esc ends)">LEARN</button>
+      <button class="btn small" id="midiImport" title="Import a mapping of another DJ program: Mixxx (.midi.xml) or Virtual DJ (device definition and mapper .xml, select both)">Import mapping…</button>
+      <input type="file" id="midiImportFile" accept=".xml,.json" multiple hidden>
+    </div>
+    <div class="midi-actions">
+      <button class="btn small" id="midiTouchA" title="Learn the touch sensor of jog wheel A (if the controller has one)">Jog touch A</button>
+      <button class="btn small" id="midiTouchB" title="Learn the touch sensor of jog wheel B (if the controller has one)">Jog touch B</button>
+      <button class="btn small" id="midiCalib" title="Turn a mapped jog wheel once around: one turn on the controller then equals one turn of the platter">Calibrate jog</button>
+    </div>
+    <div class="midi-actions midi-learn-only">
+      <button class="btn small" id="midiLibLoadA" title="Learn a button that loads the selected track into deck A">Load → A</button>
+      <button class="btn small" id="midiLibLoadB" title="Learn a button that loads the selected track into deck B">Load → B</button>
+      <button class="btn small" id="midiLibBrowse" title="Learn an encoder that moves the selection in the track list">List browse</button>
+    </div>
+    <div class="midi-actions midi-learn-only">
+      <select id="midiMore" title="Learn a function that has no control on screen: deck switch, modes, encoder functions"></select>
+    </div>
+    <div class="midi-learn-opts">
+      <label title="The control acts on the deck chosen with the deck switch (A/B) instead of a fixed deck"><input type="checkbox" id="midiLearnFocus"> Selected deck (A/B switch)</label>
+      <label title="The control does this only in the current mode; in other modes it can do something else"><input type="checkbox" id="midiLearnMode"> Only in <span id="midiLearnModeName">current mode</span></label>
+    </div>
+    <div class="midi-hint" id="midiHint">Learn mode is off.</div>
+    <label class="midi-line"><span class="midi-key">Jog sensitivity</span><input type="range" id="midiJogScale" min="0.05" max="3" step="0.05"><span id="midiJogScaleValue"></span></label>
+    <div class="midi-list" id="midiList"></div>
+    <div class="midi-foot">
+      <div class="midi-actions midi-learn-only">
+        <button class="btn small" id="midiSaveProfile" title="Save the current mapping under a name - it then appears in the Profile list (stored on the server)">Save profile…</button>
+        <button class="btn small" id="midiDeleteProfile" title="Delete the selected saved profile">Delete profile</button>
+        <button class="btn small" id="midiExport" title="Download the current mapping as a file (.embydj-midi.json) to share it - Import mapping reads it again">Export</button>
+      </div>
+      <button class="btn small" id="midiClear">Remove all</button>
+    </div>
+  </div>
 
   <div id="colMenu" class="pad-menu col-menu hidden">
     <div class="pm-title">Columns</div>

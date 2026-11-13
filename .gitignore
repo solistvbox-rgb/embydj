@@ -5,6 +5,9 @@ obj/
 # kept locally for a future release (header button for non-admin users)
 inject/
 
+# personal MIDI controller mappings (not part of the plugin)
+mapping/
+
 # original logo artwork (the repo uses the WebP versions)
 EmbyDJ-Logo.jpg
 

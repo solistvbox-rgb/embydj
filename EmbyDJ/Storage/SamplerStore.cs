@@ -13,6 +13,7 @@ namespace EmbyDJ.Storage
     /// <summary>
     /// Sampler data, per Emby user:
     ///   {DataPath}/embydj-sampler/{userId}/pads.json      - pad layout (opaque JSON object owned by the web app)
+    ///   {DataPath}/embydj-sampler/{userId}/midi-profiles.json - saved MIDI controller profiles (opaque JSON object)
     ///   {DataPath}/embydj-sampler/{userId}/{sampleId}.ext - uploaded audio (local files, loop captures)
     /// </summary>
     public class SamplerStore
@@ -72,23 +73,33 @@ namespace EmbyDJ.Storage
 
         // ---- pads ----
 
-        public string GetPads(string userId)
+        public string GetPads(string userId) => ReadJson(userId, "pads.json");
+
+        public void SetPads(string userId, string json) => WriteJson(userId, "pads.json", json);
+
+        // ---- saved MIDI controller profiles (opaque JSON object owned by the web app) ----
+
+        public string GetMidiProfiles(string userId) => ReadJson(userId, "midi-profiles.json");
+
+        public void SetMidiProfiles(string userId, string json) => WriteJson(userId, "midi-profiles.json", json);
+
+        private string ReadJson(string userId, string name)
         {
-            var file = Path.Combine(UserDir(userId), "pads.json");
+            var file = Path.Combine(UserDir(userId), name);
             lock (_lock)
             {
                 return File.Exists(file) ? File.ReadAllText(file) : null;
             }
         }
 
-        public void SetPads(string userId, string json)
+        private void WriteJson(string userId, string name, string json)
         {
-            if (string.IsNullOrWhiteSpace(json) || json.Length > MaxPadsJsonLength) throw new ArgumentException("Invalid pad data");
+            if (string.IsNullOrWhiteSpace(json) || json.Length > MaxPadsJsonLength) throw new ArgumentException("Invalid data");
             using (var doc = JsonDocument.Parse(json))
             {
-                if (doc.RootElement.ValueKind != JsonValueKind.Object) throw new ArgumentException("Pad data must be a JSON object");
+                if (doc.RootElement.ValueKind != JsonValueKind.Object) throw new ArgumentException("Data must be a JSON object");
             }
-            var file = Path.Combine(UserDir(userId), "pads.json");
+            var file = Path.Combine(UserDir(userId), name);
             lock (_lock)
             {
                 var tmp = file + ".tmp";
