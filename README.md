@@ -122,6 +122,11 @@ effect is switched off, even with the channel fader closed.
   when the deck is paused (or while the jog-touch sensor is held) and bend the tempo while playing
 - **Calibrate jog**: turn the jog wheel once around - one turn on the controller then equals one turn of the
   platter; fine-tune with the jog sensitivity
+- **Jog spins**: after a backspin / forward spin on the jog wheel (faster than scratching) the music plays on
+  as soon as the wheel slows down - forward at normal speed, backward with a short motor start - instead of
+  waiting until the controller reports the end of the movement (option in the MIDI panel)
+- **Record 3 s** in the MIDI panel records what the controller sends (with time stamps) to copy it, e.g. for a bug
+  report
 - **Track list**: click a row to select it; with MIDI an encoder can browse the list and buttons load the selected
   track into deck A or B (learn them with **List browse**, **Load → A**, **Load → B**)
 - **Deck switch and modes** for compact controllers with one control section: learn a button as *Deck switch

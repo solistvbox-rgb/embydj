@@ -571,8 +571,8 @@
     //                  click-free jumps. Needs a secure context (https or localhost).
     //   BufferEngine:  fallback with AudioBufferSourceNode - no scratching.
     // Both: load(audioBuffer), start(pos, rate), stop(), setRate(rate), setLoop(loop),
-    //       scratchBegin(pos), scratchMove(pos), scratchEnd(resume, pos, rate),
-    //       spin(vel, dur, resume, resumePos, rate), getSlice(start, end)
+    //       scratchBegin(pos), scratchMove(pos), scratchEnd(resume, pos, rate, ramp),
+    //       spin(vel, dur, resume, resumePos, rate, opts {endVel, shape, ramp}), getSlice(start, end)
     // and report back via deck.onEngineMessage({type: 'ended' | 'pos', ...}).
     // =====================================================================================
     var USE_WORKLET = false;
@@ -616,10 +616,14 @@
     WorkletEngine.prototype.setLoop = function (loop) { this.post({ type: 'loop', active: loop.active, start: loop.start, end: loop.end }); };
     WorkletEngine.prototype.scratchBegin = function (pos) { this.post({ type: 'scratchBegin', pos: pos }); };
     WorkletEngine.prototype.scratchMove = function (pos) { this.post({ type: 'scratchMove', pos: pos }); };
-    WorkletEngine.prototype.scratchEnd = function (resume, pos, rate) { this.post({ type: 'scratchEnd', resume: resume, pos: pos, rate: rate }); };
+    WorkletEngine.prototype.scratchEnd = function (resume, pos, rate, ramp) { this.post({ type: 'scratchEnd', resume: resume, pos: pos, rate: rate, ramp: ramp || 0 }); };
     // backspin (vel < 0) / brake (vel > 0): speed runs linearly from vel to 0 within dur seconds
-    WorkletEngine.prototype.spin = function (vel, dur, resume, resumePos, rate) {
-        this.post({ type: 'spin', vel: vel, dur: dur, resume: resume, resumePos: resumePos, rate: rate });
+    WorkletEngine.prototype.spin = function (vel, dur, resume, resumePos, rate, opts) {
+        opts = opts || {};
+        this.post({
+            type: 'spin', vel: vel, dur: dur, resume: resume, resumePos: resumePos, rate: rate,
+            endVel: opts.endVel || 0, shape: opts.shape || 'linear', ramp: opts.ramp || 0
+        });
         return true;
     };
 
@@ -670,14 +674,15 @@
     BufferEngine.prototype.scratchMove = function () { };
     BufferEngine.prototype.scratchEnd = function (resume, pos, rate) { if (resume) this.start(pos, rate); };
     // fallback: only a brake is possible (no reverse playback)
-    BufferEngine.prototype.spin = function (vel, dur, resume, resumePos, rate) {
+    BufferEngine.prototype.spin = function (vel, dur, resume, resumePos, rate, opts) {
         if (vel <= 0 || !this.src) return false;
-        var self = this, src = this.src, now = ctx.currentTime;
+        var self = this, src = this.src, now = ctx.currentTime, endVel = (opts && opts.endVel) || 0;
         src.playbackRate.cancelScheduledValues(now);
         src.playbackRate.setValueAtTime(vel, now);
-        src.playbackRate.linearRampToValueAtTime(0.0001, now + dur);
+        src.playbackRate.linearRampToValueAtTime(endVel || 0.0001, now + dur);
         setTimeout(function () {
             if (self.src !== src) return;
+            if (resume && endVel > 0 && resumePos == null) return;   // slowed down to the playing speed: keep going
             self.stop();
             if (resume) self.start(resumePos, rate);
         }, dur * 1000);
@@ -904,9 +909,11 @@
     };
 
     // ---- backspin / brake ----
-    // v0: start speed in track-seconds per second (negative = backwards), dur: seconds until standstill.
+    // v0: start speed in track-seconds per second (negative = backwards), dur: seconds of the spin.
     // Afterwards: slip on -> continue where the track would be; kind 'flick' while playing -> the
     // "motor" picks the record up again where the spin ended; otherwise the deck stops.
+    // A forward flick only slows down to the playing speed (no gap). A backspin slows down little at
+    // first and much at the end ('late'), so the quiet tail is short; then the motor needs ~0.12 s.
     Deck.prototype.spin = function (v0, dur, kind) {
         if (!this.buffer || this.spinState) return;
         if (v0 < 0 && !this.engine.canScratch) { toast(t('noBackspin')); return; }
@@ -916,30 +923,43 @@
         var resume = false, resumePos = null;
         if (wasPlaying && this.slip && ref) { resume = true; resumePos = clamp(ref.pos + (now + dur - ref.t) * ref.rate, 0, this.duration); }
         else if (wasPlaying && kind === 'flick') resume = true;
+        var endVel = resume && v0 > this.rate ? this.rate : 0;
+        var shape = v0 < 0 ? 'late' : 'linear';
+        var ramp = resume && v0 < 0 && resumePos == null ? 0.12 : 0;
         this.scratching = false;
         this.slipRef = null;
-        if (!this.engine.spin(v0, dur, resume, resumePos, this.rate)) {
+        if (!this.engine.spin(v0, dur, resume, resumePos, this.rate, { endVel: endVel, shape: shape, ramp: ramp })) {
             if (v0 < 0) { toast(t('noBackspin')); return; }
         }
         if (this.loop.active) { this.loop.active = false; this.engine.setLoop(this.loop); }
-        this.spinState = { p0: p0, t0: now, v0: v0, dur: dur, resume: resume, resumePos: resumePos, kind: kind };
+        this.spinState = {
+            p0: p0, t0: now, v0: v0, dur: dur, resume: resume, resumePos: resumePos, kind: kind,
+            endVel: endVel, late: shape === 'late', ramp: ramp
+        };
         var self = this;
         clearTimeout(this.spinTimer);
         this.spinTimer = setTimeout(function () { self.finishSpin(); }, dur * 1000);
     };
 
+    // distance covered after dt seconds of a spin (same speed curve as the engine)
+    function spinDistance(s, dt) {
+        var shapePart = s.late ? dt - dt * dt * dt * dt / (4 * s.dur * s.dur * s.dur) : dt - dt * dt / (2 * s.dur);
+        return s.endVel * dt + (s.v0 - s.endVel) * shapePart;
+    }
+
     Deck.prototype.spinPos = function () {
         var s = this.spinState, dt = Math.min(Math.max(0, ctx.currentTime - s.t0), s.dur);
-        return clamp(s.p0 + s.v0 * dt - 0.5 * (s.v0 / s.dur) * dt * dt, 0, this.duration);
+        return clamp(s.p0 + spinDistance(s, dt), 0, this.duration);
     };
 
     Deck.prototype.finishSpin = function () {
         var s = this.spinState;
         if (!s) return;
-        var end = clamp(s.p0 + s.v0 * s.dur / 2, 0, this.duration);
+        var end = clamp(s.p0 + spinDistance(s, s.dur), 0, this.duration);
         this.spinState = null;
         clearTimeout(this.spinTimer);
-        this.startCtx = ctx.currentTime;
+        // while the motor brings the record back to speed it covers half the distance of full speed
+        this.startCtx = ctx.currentTime + (s.resume && s.resumePos == null ? s.ramp / 2 : 0);
         if (s.resume) { this.playing = true; this.pos = s.resumePos != null ? s.resumePos : end; }
         else { this.playing = false; this.pos = end; }
     };
@@ -999,7 +1019,8 @@
         this.engine.scratchMove(this.scratchPos);
     };
 
-    Deck.prototype.scratchEnd = function () {
+    // ramp: seconds the "motor" needs to bring the record back to speed (after a backspin on a controller)
+    Deck.prototype.scratchEnd = function (ramp) {
         if (!this.scratching) return;
         this.scratching = false;
         var resumePos = null;
@@ -1014,8 +1035,9 @@
             this.engine.setLoop(this.loop);
         }
         this.pos = p;
-        this.startCtx = ctx.currentTime;
-        if (this.playing) this.engine.scratchEnd(true, this.engine.canScratch ? resumePos : p, this.rate);
+        ramp = resumePos == null && typeof ramp === 'number' ? ramp : 0;
+        this.startCtx = ctx.currentTime + ramp / 2;   // during the ramp the record covers half the distance
+        if (this.playing) this.engine.scratchEnd(true, this.engine.canScratch ? resumePos : p, this.rate, ramp);
         else this.engine.scratchEnd(false);
     };
 
@@ -3160,6 +3182,8 @@
         access: null, map: {}, learn: false, pending: null, relearn: null, jogScale: 1,
         jogStepsPerRev: 400,   // messages per full turn of the hardware jog (set by the calibration)
         calib: null,           // running calibration: { sum }
+        flick: true,           // after a jog spin, play on as soon as the wheel slows down (no gap)
+        rec: null,             // running recording of the incoming messages: { t0, lines, timer }
         modes: [],             // modes of the controller (e.g. sampler, loop, fx, cue)
         startMode: '',         // mode after loading the mapping
         mode: '',              // current mode
@@ -3276,7 +3300,8 @@
         try {
             localStorage.setItem(MIDI_STORE, JSON.stringify({
                 map: midi.map, jogScale: midi.jogScale, jogStepsPerRev: midi.jogStepsPerRev, leds: midi.leds,
-                active: midi.active, modes: midi.modes, startMode: midi.startMode, mode: midi.mode, focus: midi.focus
+                active: midi.active, modes: midi.modes, startMode: midi.startMode, mode: midi.mode, focus: midi.focus,
+                spinHandOver: midi.flick
             }));
         } catch (e) { /* ignore */ }
         midiRenderPanel();
@@ -3297,6 +3322,7 @@
             midi.startMode = s.startMode || '';
             midi.mode = midi.modes.indexOf(s.mode) >= 0 ? s.mode : (midi.modes[0] || '');
             midi.focus = s.focus === 1 ? 1 : 0;
+            midi.flick = s.spinHandOver !== false;
         } catch (e) { midi.map = {}; midi.leds = []; midi.modes = []; }
     }
 
@@ -3311,9 +3337,15 @@
         midiFocusUi();
     }
 
-    // the selected deck is outlined when the mapping has a deck switch
+    function midiHasDevice() {
+        var any = false;
+        if (midi.access) midi.access.inputs.forEach(function (input) { if (input.state === 'connected') any = true; });
+        return any;
+    }
+
+    // the selected deck is outlined when the mapping has a deck switch and a controller is connected
     function midiFocusUi() {
-        var on = midiUsesFocus();
+        var on = midiUsesFocus() && midiHasDevice();
         toggle($('#deckA .deck'), 'midi-focus', on && midi.focus === 0);
         toggle($('#deckB .deck'), 'midi-focus', on && midi.focus === 1);
     }
@@ -3376,6 +3408,10 @@
         var m = msg.kind === 'note' && !msg.on && midi.held[msg.key] ? midi.held[msg.key] : midiLookup(msg.key);
         if (msg.kind === 'note') { if (msg.on) { if (m) midi.held[msg.key] = m; } else delete midi.held[msg.key]; }
 
+        if (midi.rec) {
+            var bytes = Array.prototype.map.call(e.data, function (x) { return ('0' + x.toString(16)).slice(-2); }).join(' ');
+            midiRecord(bytes + '   ' + midiDescribe(msg.key) + ' = ' + msg.raw + (m ? '   ' + midiLabel(m.target) : ''));
+        }
         midi.last = midiDescribe(msg.key) + ' = ' + msg.raw;
         if (m && /\.jog$/.test(m.target)) midi.last += '  (step ' + midiJogSteps(msg) + ')';
         if (m) midi.last += '  → ' + midiLabel(m.target);
@@ -3511,14 +3547,38 @@
     // ---- jog wheel ----
     // one hardware turn = one turn of the platter (SEC_PER_REV), via the calibrated steps per turn,
     // fine-tuned by the jog sensitivity of the MIDI panel
+    //
+    // Spins: the music follows the real wheel, also while it coasts after a push. Small controllers
+    // report the end of a movement late (the DJ-Tech MIX-101 has no touch sensor, its "touch" note means
+    // "the wheel moves" and goes off ~0.3 s after the wheel stopped) - following the standing wheel until
+    // then gives a gap of silence. So after a fast movement (a spin, faster than scratching) EmbyDJ hands
+    // over to normal playback on its own: forward as soon as the coasting wheel is back to the playing
+    // speed (seamless), backward as soon as it has almost stopped (with a short motor start).
+    // The rest of that movement is ignored.
+    var MIDI_SPIN_MIN = 3;   // × playing speed: movements this fast are spins (scratch strokes are slower)
+
     Deck.prototype.midiJog = function (steps) {
         if (!this.buffer) return;
-        var self = this, secs = steps * SEC_PER_REV / midi.jogStepsPerRev * midi.jogScale;
+        var self = this, now = performance.now();
+        if (this.mjHanded) {
+            // the coasting wheel after a hand-over: ignored until it has been still for 150 ms
+            clearTimeout(this.mjHandTimer);
+            this.mjHandTimer = setTimeout(function () { self.mjHanded = false; }, 150);
+            return;
+        }
+        var secs = steps * SEC_PER_REV / midi.jogStepsPerRev * midi.jogScale;
         clearTimeout(this.midiJogTimer);
         if (this.midiTouching || !this.playing || this.scratching) {
+            clearTimeout(this.mjTouchTimer);
             if (!this.scratching) this.scratchBegin();
             this.scratchMove(secs);
-            if (!this.midiTouching) this.midiJogTimer = setTimeout(function () { self.scratchEnd(); }, 120);
+            if (this.midiSpinTrack(secs, now)) return;
+            if (this.mjSpin) {
+                // after a spin the wheel stopped without the slow tail: hand over now
+                this.midiJogTimer = setTimeout(function () { self.midiHandOver('wheel stopped'); }, 40);
+            } else if (!this.midiTouching) {
+                this.midiJogTimer = setTimeout(function () { self.scratchEnd(); }, 120);
+            }
         } else {
             this.setNudge(clamp(1 + steps * 1.6 / midi.jogStepsPerRev * midi.jogScale, 0.85, 1.15));
             this.midiJogTimer = setTimeout(function () { self.setNudge(1); }, 80);
@@ -3527,9 +3587,114 @@
 
     Deck.prototype.midiTouch = function (on) {
         this.midiTouching = on;
-        if (on && this.buffer && this.vinyl) { clearTimeout(this.midiJogTimer); if (!this.scratching) this.scratchBegin(); }
-        if (!on && this.scratching) this.scratchEnd();
+        this.mjHist = [];
+        this.mjPrevT = 0;
+        if (on) {
+            if (this.mjHanded && performance.now() - (this.mjHandAt || 0) < 400) return;   // still the coasting spin
+            this.mjHanded = false;
+            this.mjSpin = null;
+        }
+        if (on && this.buffer && this.vinyl) {
+            clearTimeout(this.midiJogTimer);
+            clearTimeout(this.mjTouchTimer);
+            if (!this.playing) {
+                if (!this.scratching) this.scratchBegin();   // hold a paused record
+            } else {
+                // playing: the record is held only if the hand does not move it right away -
+                // a push that follows the touch then starts without a gap
+                var self = this;
+                this.mjTouchTimer = setTimeout(function () { if (self.midiTouching && !self.scratching) self.scratchBegin(); }, 150);
+            }
+        }
+        if (!on) {
+            clearTimeout(this.mjTouchTimer);
+            clearTimeout(this.midiJogTimer);
+            if (this.scratching && !(this.mjSpin && this.midiHandOver('released'))) this.scratchEnd();
+            this.mjSpin = null;
+        }
     };
+
+    // follows the speed of the wheel; returns true when it handed a spin over to normal playback
+    Deck.prototype.midiSpinTrack = function (secs, now) {
+        var prevT = this.mjPrevT;
+        this.mjPrevT = now;
+        var h = this.mjHist || (this.mjHist = []);
+        h.push({ t: now, s: secs });
+        while (h.length && now - h[0].t > 100) h.shift();
+        if (!midi.flick || !this.playing) { this.mjSpin = null; return false; }
+        if (h.length >= 3) {
+            // speed over ~100 ms (n messages span n - 1 gaps: scale the span to n gaps)
+            var sum = 0;
+            h.forEach(function (x) { sum += x.s; });
+            var v = sum / Math.max(0.02, (now - h[0].t) / 1000 * h.length / (h.length - 1));
+            if (Math.abs(v) >= MIDI_SPIN_MIN) {
+                var sp = this.mjSpin;
+                this.mjSpin = { peak: sp && (sp.peak > 0) === (v > 0) && Math.abs(sp.peak) > Math.abs(v) ? sp.peak : v };
+            }
+        }
+        var spin = this.mjSpin;
+        if (!spin) return false;
+        // speed just now: the messages of the last 30 ms, measured from the message before them
+        var i = 0;
+        while (i < h.length && now - h[i].t > 30) i++;
+        var before = i > 0 ? h[i - 1].t : prevT;
+        if (!before) return false;
+        var rs = 0;
+        for (var k = i; k < h.length; k++) rs += h[k].s;
+        var vr = rs / Math.max(0.001, (now - before) / 1000);
+        if ((vr > 0) !== (spin.peak > 0)) { this.mjSpin = null; return false; }   // turned back: scratching
+        if (spin.peak > 0 && vr <= this.rate) return this.midiHandOver('back to normal speed');
+        if (spin.peak < 0 && -vr < 0.4) return this.midiHandOver('wheel almost stopped');
+        return false;
+    };
+
+    Deck.prototype.midiHandOver = function (reason) {
+        var spin = this.mjSpin, self = this;
+        this.mjSpin = null;
+        if (!spin || !this.scratching || !this.playing) return false;
+        clearTimeout(this.midiJogTimer);
+        this.mjHist = [];
+        this.mjHanded = true;
+        this.mjHandAt = performance.now();
+        clearTimeout(this.mjHandTimer);
+        this.mjHandTimer = setTimeout(function () { self.mjHanded = false; }, 150);
+        this.scratchEnd(spin.peak < 0 ? 0.12 : 0);   // after a backspin the motor needs a moment
+        midiRecord('   >> jog ' + this.id + ': spin ×' + Math.abs(spin.peak).toFixed(1) + (spin.peak > 0 ? ' forward' : ' backward') +
+            ' - playing on (' + reason + ')');
+        if (!midi.learn && !midi.calib && $('#midiHint')) {
+            $('#midiHint').textContent = 'Jog ' + this.id + ': ' + (spin.peak > 0 ? 'forward' : 'back') + 'spin ×' +
+                Math.abs(spin.peak).toFixed(1) + ' - playing on (' + reason + ')';
+        }
+        return true;
+    };
+
+    // ---- recording (to see what a controller really sends, e.g. during a spin) ----
+    function midiRecord(line) {
+        if (!midi.rec) return;
+        var t = performance.now() - midi.rec.t0;
+        midi.rec.lines.push(('     ' + t.toFixed(0)).slice(-5) + ' ms  ' + line);
+    }
+
+    function midiRecordStart() {
+        if (midi.rec) return;
+        if (!midi.access) { toast('Connect the MIDI controller first.'); return; }
+        var btn = $('#midiRecord'), out = $('#midiRecordOut');
+        midi.rec = { t0: performance.now(), lines: [] };
+        btn.classList.add('on');
+        btn.textContent = 'Recording…';
+        out.classList.add('hidden');
+        midi.rec.timer = setTimeout(function () {
+            var lines = midi.rec.lines;
+            midi.rec = null;
+            btn.classList.remove('on');
+            btn.textContent = 'Record 3 s';
+            out.value = 'EmbyDJ MIDI recording (' + lines.length + ' messages, jog spin hand-over ' + (midi.flick ? 'on' : 'off') +
+                ', ' + midi.jogStepsPerRev + ' steps per turn)\n' + (lines.join('\n') || '(nothing received)');
+            out.classList.remove('hidden');
+            out.focus();
+            out.select();
+        }, 3000);
+    }
 
     // ---- learn mode ----
     function midiSetPending(target) {
@@ -3635,6 +3800,7 @@
         midi.access.inputs.forEach(function (input) { names.push(input.name + (input.state === 'connected' ? '' : ' (disconnected)')); });
         el.textContent = names.length ? names.join(', ') : 'No MIDI device found - connect it and wait a moment.';
         toggle($('#midiBtn'), 'on', names.length > 0);
+        midiFocusUi();   // controller plugged in or out
     }
 
     function midiConnect() {
@@ -3751,6 +3917,9 @@
         sens.value = midi.jogScale;
         showSens();
         sens.addEventListener('input', function () { midi.jogScale = +sens.value; showSens(); midiSave(); });
+        $('#midiRecord').addEventListener('click', midiRecordStart);
+        $('#midiFlick').checked = midi.flick;
+        $('#midiFlick').addEventListener('change', function () { midi.flick = this.checked; midiSave(); });
         document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && midi.learn) midiSetLearn(false); });
 
         midiSave();

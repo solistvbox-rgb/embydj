@@ -271,7 +271,9 @@
       </select>
     </label>
     <div class="midi-line"><span class="midi-key">Mode</span><select id="midiModeSel" title="Current mode of the controller (switch it on the device or here)"></select><button class="btn tiny" id="midiModesEdit" title="Define the modes of the controller (e.g. sampler, loop, fx, cue)">Modes…</button></div>
-    <div class="midi-line"><span class="midi-key">Last message</span><span id="midiMonitor">-</span></div>
+    <div class="midi-line"><span class="midi-key">Last message</span><span id="midiMonitor">-</span>
+      <button class="btn tiny" id="midiRecord" title="Records all messages of the controller for 3 seconds with time stamps - to copy and send them, e.g. for a jog problem">Record 3 s</button></div>
+    <textarea id="midiRecordOut" class="midi-record hidden" readonly spellcheck="false"></textarea>
     <div class="midi-actions">
       <button class="btn small" id="midiLearnBtn" title="Click a control in EmbyDJ, then move or press the control on the device (Esc ends)">LEARN</button>
       <button class="btn small" id="midiImport" title="Import a mapping of another DJ program: Mixxx (.midi.xml) or Virtual DJ (device definition and mapper .xml, select both)">Import mapping…</button>
@@ -296,6 +298,7 @@
     </div>
     <div class="midi-hint" id="midiHint">Learn mode is off.</div>
     <label class="midi-line"><span class="midi-key">Jog sensitivity</span><input type="range" id="midiJogScale" min="0.05" max="3" step="0.05"><span id="midiJogScaleValue"></span></label>
+    <label class="midi-line midi-check" title="After a spin on the jog wheel (faster than scratching) the music plays on as soon as the wheel slows down - forward at normal speed, backward with a short motor start - instead of waiting until the controller reports the end of the movement."><input type="checkbox" id="midiFlick"> Jog spins: play on when the wheel slows down</label>
     <div class="midi-list" id="midiList"></div>
     <div class="midi-foot">
       <div class="midi-actions midi-learn-only">

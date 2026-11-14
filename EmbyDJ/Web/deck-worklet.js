@@ -10,8 +10,11 @@
  *
  * Messages in (port):  load {L, R}, unload, play {pos?, rate, when?}, stop, seek {pos}, rate {rate},
  *                      loop {active, start, end}, scratchBegin {pos}, scratchMove {pos},
- *                      scratchEnd {resume, pos?, rate},
- *                      spin {vel, dur, resume, resumePos?, rate}  (backspin: vel < 0, brake: vel > 0),
+ *                      scratchEnd {resume, pos?, rate, ramp?}  (ramp: seconds of motor start from standstill),
+ *                      spin {vel, dur, resume, resumePos?, rate, endVel?, shape?, ramp?}
+ *                        (backspin: vel < 0, brake: vel > 0; the speed runs from vel to endVel (default 0),
+ *                        shape 'late' (1 - u^3) slows down little at first and much at the end (short quiet tail),
+ *                        ramp: seconds the "motor" needs to bring the record back to speed afterwards),
  *                      slice {id, start, end}
  * Messages out:        ended, pos {pos, time}   (pos in seconds, time = AudioContext time),
  *                      slice {id, L, R}
@@ -37,10 +40,17 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
         this.fadePos = 0;      // read head of the outgoing signal during a crossfade
         this.fadeStep = 0;
         this.pendingPlay = null; // play scheduled for a later AudioContext time (Auto-Mix)
-        this.spin = false;     // backspin / brake: speed runs linearly from vel to 0
-        this.spinDecel = 0;
+        this.spin = false;     // backspin / brake / spin: speed runs from spinV0 to spinEnd
+        this.spinV0 = 0;
+        this.spinEnd = 0;
+        this.spinN = 1;        // length of the spin, in samples
+        this.spinI = 0;
+        this.spinLate = false;
         this.spinResume = false;
         this.spinResumePos = null;
+        this.spinRamp = 0;
+        this.rampN = 0;        // motor start after a spin: speed 0 -> rate over rampN samples
+        this.rampI = 0;
         this.port.onmessage = (e) => this.onMessage(e.data);
     }
 
@@ -57,6 +67,7 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
                 break;
             case 'play':
                 this.spin = false;
+                this.rampN = 0;
                 if (m.when && m.when > currentTime + 0.003) { this.pendingPlay = m; break; }
                 this.pendingPlay = null;
                 if (m.pos != null) this.jump(m.pos * sr);
@@ -66,11 +77,13 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
             case 'stop':
                 this.pendingPlay = null;
                 this.spin = false;
+                this.rampN = 0;
                 this.playing = false;
                 break;
             case 'seek':
                 this.pendingPlay = null;
                 this.spin = false;
+                this.rampN = 0;
                 this.jump(m.pos * sr);
                 break;
             case 'rate':
@@ -91,6 +104,7 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
             }
             case 'scratchBegin':
                 this.spin = false;
+                this.rampN = 0;
                 this.scratch = true;
                 this.target = m.pos * sr;
                 if (Math.abs(this.target - this.pos) > sr * 0.05) this.jump(this.target);
@@ -104,9 +118,15 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
                 this.scratch = false;
                 this.spin = true;
                 this.vel = m.vel;
-                this.spinDecel = m.vel / Math.max(1, m.dur * sr);
+                this.spinV0 = m.vel;
+                this.spinEnd = m.endVel || 0;
+                this.spinN = Math.max(1, Math.round(m.dur * sr));
+                this.spinI = 0;
+                this.spinLate = m.shape === 'late';
                 this.spinResume = !!m.resume;
                 this.spinResumePos = m.resumePos;
+                this.spinRamp = m.ramp || 0;
+                this.rampN = 0;
                 this.rate = m.rate;
                 this.playing = false;
                 break;
@@ -116,6 +136,13 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
                     this.rate = m.rate;
                     this.playing = true;
                     if (m.pos != null) this.jump(m.pos * sr);
+                    if (m.ramp > 0 && m.pos == null) {
+                        // motor start; the position is reported when the record is up to speed
+                        this.rampN = Math.round(m.ramp * sr);
+                        this.rampI = 0;
+                        break;
+                    }
+                    this.rampN = 0;
                     // tell the main thread where playback really continues
                     this.port.postMessage({ type: 'pos', pos: this.pos / sr, time: currentTime });
                 } else {
@@ -168,14 +195,21 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
         for (let i = 0; i < n; i++) {
             let step;
             if (this.spin) {
-                step = this.vel;
-                this.vel -= this.spinDecel;
-                if ((this.spinDecel < 0 && this.vel >= 0) || (this.spinDecel > 0 && this.vel <= 0)) {
-                    this.vel = 0;
+                const u = this.spinI / this.spinN;
+                step = this.vel = this.spinEnd + (this.spinV0 - this.spinEnd) * (this.spinLate ? 1 - u * u * u : 1 - u);
+                if (++this.spinI >= this.spinN) {
+                    this.vel = this.spinEnd;
                     this.spin = false;
                     if (this.spinResume) {
                         if (this.spinResumePos != null) this.jump(this.spinResumePos * sr);
                         this.playing = true;
+                        if (this.spinEnd === 0 && this.spinRamp > 0 && this.spinResumePos == null) {
+                            // the motor pulls the record back to speed; the position is reported when done
+                            this.rampN = Math.round(this.spinRamp * sr);
+                            this.rampI = 0;
+                        } else {
+                            this.port.postMessage({ type: 'pos', pos: this.pos / sr, time: currentTime });
+                        }
                     }
                 }
             } else if (this.scratch) {
@@ -183,7 +217,15 @@ class EmbyDJDeckProcessor extends AudioWorkletProcessor {
                 this.vel += (want - this.vel) * smoothing;
                 step = this.vel;
             } else if (this.playing) {
-                step = this.rate;
+                if (this.rampN > 0) {
+                    step = this.rate * this.rampI / this.rampN;
+                    if (++this.rampI >= this.rampN) {
+                        this.rampN = 0;
+                        this.port.postMessage({ type: 'pos', pos: this.pos / sr, time: currentTime });
+                    }
+                } else {
+                    step = this.rate;
+                }
                 this.vel = step;
             } else {
                 // stopping: let the platter run out during the fade-out instead of freezing
