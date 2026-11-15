@@ -1547,8 +1547,55 @@
 
     function toggle(el, cls, on) { if (el.classList.contains(cls) !== on) el.classList.toggle(cls, on); }
 
+    // ---- UI size: the whole view (#app) is zoomed; "auto" fits decks, mixer and part of the list ----
+    // Menus and panels stay outside #app and keep their size.
+    var UI_LIB_MIN = 230;    // px of the track list that should stay visible (auto)
+    var UI_MIN_WIDTH = 1180; // px the layout needs side by side (auto)
+    var uiZoom = 1;
+    var uiSize = (function () { try { return localStorage.getItem('embydj-uisize') || 'auto'; } catch (e) { return 'auto'; } })();
+
+    // canvas pixels per CSS pixel: display scaling x UI size
+    function pxScale() { return (window.devicePixelRatio || 1) * uiZoom; }
+
+    function applyUiSize() {
+        var app = $('#app'), z;
+        if (uiSize === 'auto') {
+            // the height decks and mixer need at 100 %, measured in the current (zoomed) view
+            var a = app.getBoundingClientRect(), d = $('.decks').getBoundingClientRect();
+            var need = (d.bottom - a.top) / uiZoom + UI_LIB_MIN;
+            z = Math.min(1, window.innerHeight / need, window.innerWidth / UI_MIN_WIDTH);
+            z = Math.max(0.6, Math.floor(z * 20) / 20);   // 5 % steps, so it does not flicker
+        } else {
+            z = clamp(+uiSize / 100 || 1, 0.5, 1);
+        }
+        uiZoom = z;
+        app.style.zoom = z === 1 ? '' : String(z);
+        // 100vh would be zoomed too: give the view the full window height in its own (zoomed) pixels
+        app.style.height = z === 1 ? '' : (window.innerHeight / z) + 'px';
+        var sel = $('#uiSize');
+        if (sel) sel.title = 'UI size' + (uiSize === 'auto' ? ' - auto: ' + Math.round(z * 100) + ' %' : '');
+    }
+
+    function bindUiSize() {
+        var sel = $('#uiSize');
+        sel.value = uiSize;
+        if (sel.value !== uiSize) { uiSize = 'auto'; sel.value = 'auto'; }
+        sel.addEventListener('change', function () {
+            uiSize = sel.value;
+            try { localStorage.setItem('embydj-uisize', uiSize); } catch (e) { /* ignore */ }
+            applyUiSize();
+        });
+        var pending = false;
+        window.addEventListener('resize', function () {
+            if (pending) return;
+            pending = true;
+            requestAnimationFrame(function () { pending = false; applyUiSize(); });
+        });
+        applyUiSize();
+    }
+
     function fitCanvas(cv) {
-        var dpr = window.devicePixelRatio || 1;
+        var dpr = pxScale();
         var w = Math.round(cv.clientWidth * dpr), h = Math.round(cv.clientHeight * dpr);
         if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; return true; }
         return false;
@@ -1678,7 +1725,7 @@
         g.fillRect(x, 0, 2, H);
         g.beginPath(); g.moveTo(x - 6, 0); g.lineTo(x + 8, 0); g.lineTo(x + 1, 9); g.closePath(); g.fill();
         if (label) {
-            var dpr = window.devicePixelRatio || 1;
+            var dpr = pxScale();
             g.font = 'bold ' + Math.round(10 * dpr) + 'px system-ui';
             g.fillText(label, x + 4, H - 4);
         }
@@ -4686,6 +4733,7 @@
                 window.open(location.pathname + '?v=' + Date.now(), '_blank');
             });
         }
+        bindUiSize();
         $('#helpBtn').addEventListener('click', function () { $('#help').classList.remove('hidden'); });
         $('#helpClose').addEventListener('click', function () { $('#help').classList.add('hidden'); });
 

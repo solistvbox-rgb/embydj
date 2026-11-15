@@ -32,6 +32,10 @@ full-window in its own tab, and uses the session of the signed-in administrator.
 EmbyDJ then appears in the dashboard under **Advanced → EmbyDJ**. The **Open in new tab** button in its top bar
 opens it full-window.
 
+On small screens or with display scaling (125 %, 150 %) the **Size** setting in the top bar helps: **Auto** (the
+default) scales the view down until decks, mixer and part of the track list fit into the window; 100 – 60 % are
+fixed sizes. The choice is kept per browser.
+
 ## Features
 
 ### Decks
