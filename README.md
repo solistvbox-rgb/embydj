@@ -8,6 +8,10 @@ An [Emby Server](https://emby.media) plugin that turns the Emby web app into a *
 own music library: waveforms, BPM detection, sync, loops, hot cues, effects, scratching and a sampler - all in
 the browser, with the tracks coming straight from Emby.
 
+<p align="center">
+  <img src="docs/embydj-preview.webp" alt="EmbyDJ: transition from deck B to deck A with a backspin on B" width="100%">
+</p>
+
 EmbyDJ is a web app served by the plugin for **Emby administrators**. It opens inside the Emby dashboard or
 full-window in its own tab, and uses the session of the signed-in administrator.
 
